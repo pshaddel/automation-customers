@@ -101,29 +101,6 @@ export async function getUserById(id: string): Promise<PublicUser> {
   return toPublicUser(row);
 }
 
-export async function listUsers({
-  limit,
-  offset,
-}: {
-  limit: number;
-  offset: number;
-}): Promise<{ items: PublicUser[]; total: number }> {
-  const db = getDb();
-  const [rows, countRows] = await Promise.all([
-    db<UserRow[]>`
-      SELECT id, username, name, created_at, updated_at
-      FROM users
-      WHERE deleted_at IS NULL
-      ORDER BY created_at, id
-      LIMIT ${limit} OFFSET ${offset}
-    `,
-    db<
-      { total: number }[]
-    >`SELECT count(*)::int AS total FROM users WHERE deleted_at IS NULL`,
-  ]);
-  return { items: rows.map(toPublicUser), total: countRows[0]?.total ?? 0 };
-}
-
 export async function updateUser(
   id: string,
   patch: { name: string },

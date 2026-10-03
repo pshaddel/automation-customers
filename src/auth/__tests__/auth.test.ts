@@ -146,18 +146,10 @@ describe.skipIf(!dbReady)("auth", () => {
     expect((await request("GET", "/api/me", { cookie })).status).toBe(401);
   });
 
-  test("soft-delete: old cookie and sign-in both return 401; others cannot delete you", async () => {
+  test("soft-delete: old cookie and sign-in both return 401", async () => {
     const { res, username } = await signUp();
     const cookie = sidCookie(res);
-    const me = await json(await request("GET", "/api/me", { cookie }));
-
-    const other = await signUp();
-    const forbidden = await request("DELETE", `/api/users/${me.id}`, {
-      cookie: sidCookie(other.res),
-    });
-    expect(forbidden.status).toBe(403);
-
-    const del = await request("DELETE", `/api/users/${me.id}`, { cookie });
+    const del = await request("DELETE", "/api/me", { cookie });
     expect(del.status).toBe(204);
 
     expect((await request("GET", "/api/me", { cookie })).status).toBe(401);
@@ -173,32 +165,24 @@ describe.skipIf(!dbReady)("auth", () => {
     expect(reuse.status).toBe(409);
   });
 
-  test("users list/get/patch", async () => {
+  test("me: get and update own profile", async () => {
     const { res } = await signUp();
     const cookie = sidCookie(res);
-    const me = await json(await request("GET", "/api/me", { cookie }));
 
-    const list = await request("GET", "/api/users?limit=5&offset=0", {
-      cookie,
-    });
-    expect(list.status).toBe(200);
-    const listBody = await json(list);
-    expect(listBody.items.length).toBeLessThanOrEqual(5);
-    expect(typeof listBody.total).toBe("number");
+    const me = await request("GET", "/api/me", { cookie });
+    expect(me.status).toBe(200);
 
-    const got = await request("GET", `/api/users/${me.id}`, { cookie });
-    expect(got.status).toBe(200);
-
-    const missing = await request("GET", `/api/users/${crypto.randomUUID()}`, {
-      cookie,
-    });
-    expect(missing.status).toBe(404);
-
-    const patched = await request("PATCH", `/api/users/${me.id}`, {
+    const patched = await request("PATCH", "/api/me", {
       cookie,
       body: { name: "Renamed" },
     });
     expect(patched.status).toBe(200);
     expect((await json(patched)).name).toBe("Renamed");
+  });
+
+  test("other users are not exposed", async () => {
+    const { res } = await signUp();
+    const cookie = sidCookie(res);
+    expect((await request("GET", "/api/users", { cookie })).status).toBe(404);
   });
 });
