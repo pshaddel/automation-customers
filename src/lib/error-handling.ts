@@ -11,7 +11,12 @@ export const errorHandling = new Elysia({ name: "error-handling" }).onError(
     }
     if (code === "VALIDATION") {
       set.status = 422;
-      return { error: "VALIDATION", message: error.message };
+      const first = error.valueError;
+      const field = first?.path.replace(/^\//, "");
+      const message = first
+        ? `${field ? `${field}: ` : ""}${first.message}`
+        : "Invalid request";
+      return { error: "VALIDATION", message, details: error.all };
     }
     if (code === "NOT_FOUND") {
       set.status = 404;

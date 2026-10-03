@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Automation Customers</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8; --surface: #fff; --text: #1b1b1f; --muted: #6b6b76;
+    --border: #e2e2e7; --accent: #2f5bea; --accent-text: #fff;
+    --danger: #c62828; --danger-bg: #fdecec; --ok: #1e7d3a; --ok-bg: #e8f5ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121214; --surface: #1c1c20; --text: #ececf1; --muted: #9a9aa6;
+      --border: #2e2e35; --accent: #6d8dff; --accent-text: #0b0b0d;
+      --danger: #ff8a80; --danger-bg: #3a1d1d; --ok: #7bd88f; --ok-bg: #16301d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    max-width: 960px; margin: 0 auto; padding: 20px 16px 8px; }
+  header h1 { font-size: 20px; margin: 0; }
+  main { max-width: 960px; margin: 0 auto; padding: 8px 16px 40px; display: grid; gap: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  section.wide { grid-column: 1 / -1; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  form { display: grid; gap: 8px; }
+  label { display: grid; gap: 2px; font-size: 13px; color: var(--muted); }
+  input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 9px; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { font: inherit; border: 0; border-radius: 6px; padding: 7px 12px; cursor: pointer;
+    background: var(--accent); color: var(--accent-text); justify-self: start; }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+  button:disabled { opacity: .5; cursor: default; }
+  a { color: var(--accent); }
+  .muted { color: var(--muted); font-size: 13px; }
+  .error { color: var(--danger); background: var(--danger-bg); border-radius: 6px; padding: 6px 9px;
+    font-size: 13px; }
+  .ok { color: var(--ok); background: var(--ok-bg); border-radius: 6px; padding: 6px 9px; font-size: 13px; }
+  [hidden] { display: none; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  progress { width: 100%; height: 10px; accent-color: var(--accent); }
+  code { font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Automation Customers</h1>
+  <a href="/openapi">API docs (OpenAPI)</a>
+</header>
+
+<main>
+  <section id="auth-forms">
+    <h2>Sign up</h2>
+    <form id="sign-up">
+      <label>Username <input name="username" required minlength="3" maxlength="32" pattern="[a-z0-9_]+"
+        autocomplete="username" placeholder="lowercase, digits, _"></label>
+      <label>Name <input name="name" required maxlength="100" autocomplete="name"></label>
+      <label>Password <input name="password" type="password" required minlength="8" maxlength="128"
+        autocomplete="new-password"></label>
+      <button type="submit">Create account</button>
+      <div class="error" hidden></div>
+    </form>
+  </section>
+
+  <section id="sign-in-section">
+    <h2>Sign in</h2>
+    <form id="sign-in">
+      <label>Username <input name="username" required autocomplete="username"></label>
+      <label>Password <input name="password" type="password" required autocomplete="current-password"></label>
+      <button type="submit">Sign in</button>
+      <div class="error" hidden></div>
+    </form>
+    <p class="muted">Seeded demo users: alice, bob, carol / <code>Password123!</code></p>
+  </section>
+
+  <section id="me">
+    <h2>Current user</h2>
+    <div id="me-body" class="muted">Not signed in.</div>
+    <div class="row" style="margin-top:10px">
+      <button type="button" id="sign-out" class="secondary" hidden>Sign out</button>
+    </div>
+    <div class="error" id="me-error" hidden></div>
+  </section>
+
+  <section id="jobs">
+    <h2>Enqueue example job</h2>
+    <form id="job-form">
+      <label>Message <input name="message" required></label>
+      <button type="submit">Enqueue</button>
+      <div class="error" hidden></div>
+    </form>
+    <div id="job-status" hidden style="margin-top:12px">
+      <div class="row"><span>Job <code id="job-id"></code></span><strong id="job-state"></strong></div>
+      <progress id="job-progress" max="100" value="0"></progress>
+      <div id="job-reason" class="error" hidden></div>
+    </div>
+  </section>
+
+  <section class="wide">
+    <div class="row" style="justify-content:space-between">
+      <h2>Users</h2>
+      <button type="button" id="refresh-users" class="secondary">Refresh</button>
+    </div>
+    <div class="error" id="users-error" hidden></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Username</th><th>Name</th><th>Created</th><th></th></tr></thead>
+        <tbody id="users-body"><tr><td colspan="4" class="muted">Sign in to see users.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+  let currentUser = null;
+  let pollTimer = null;
+
+  async function api(method, path, body) {
+    const res = await fetch(path, {
+      method,
+      credentials: "include",
+      headers: body === undefined ? {} : { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (res.status === 204) return null;
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+    if (!res.ok) {
+      const message = (data && (data.message || data.error)) || `HTTP ${res.status}`;
+      const err = new Error(message);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
+
+  function showError(el, err) {
+    if (!el) return;
+    el.textContent = err ? (err.message || String(err)) : "";
+    el.hidden = !err;
+  }
+
+  function formError(form) { return form.querySelector(".error"); }
+
+  function el(tag, props = {}, children = []) {
+    const node = Object.assign(document.createElement(tag), props);
+    for (const child of [].concat(children)) node.append(child);
+    return node;
+  }
+
+  function renderMe() {
+    const body = document.getElementById("me-body");
+    const signedIn = !!currentUser;
+    document.getElementById("sign-out").hidden = !signedIn;
+    body.className = signedIn ? "" : "muted";
+    body.replaceChildren(
+      signedIn
+        ? el("div", {}, [
+            el("div", {}, [el("strong", { textContent: currentUser.name }), ` (@${currentUser.username})`]),
+            el("div", { className: "muted", textContent: `id ${currentUser.id}` }),
+          ])
+        : "Not signed in.",
+    );
+  }
+
+  async function loadMe() {
+    try {
+      currentUser = await api("GET", "/api/me");
+    } catch (err) {
+      currentUser = null;
+      if (err.status !== 401) showError(document.getElementById("me-error"), err);
+    }
+    renderMe();
+    await loadUsers();
+  }
+
+  async function loadUsers() {
+    const tbody = document.getElementById("users-body");
+    const errEl = document.getElementById("users-error");
+    showError(errEl, null);
+    if (!currentUser) {
+      tbody.replaceChildren(el("tr", {}, el("td", { colSpan: 4, className: "muted", textContent: "Sign in to see users." })));
+      return;
+    }
+    try {
+      const { items, total } = await api("GET", "/api/users?limit=100&offset=0");
+      if (items.length === 0) {
+        tbody.replaceChildren(el("tr", {}, el("td", { colSpan: 4, className: "muted", textContent: "No users." })));
+        return;
+      }
+      tbody.replaceChildren(...items.map((u) => {
+        const isSelf = u.id === currentUser.id;
+        const action = isSelf
+          ? el("button", { className: "danger", textContent: "Delete my account", onclick: () => deleteSelf(u.id) })
+          : "";
+        return el("tr", {}, [
+          el("td", { textContent: u.username + (isSelf ? " (you)" : "") }),
+          el("td", { textContent: u.name }),
+          el("td", { textContent: new Date(u.createdAt).toLocaleString() }),
+          el("td", {}, action),
+        ]);
+      }));
+      if (total > items.length) {
+        tbody.append(el("tr", {}, el("td", { colSpan: 4, className: "muted", textContent: `Showing ${items.length} of ${total}.` })));
+      }
+    } catch (err) {
+      showError(errEl, err);
+    }
+  }
+
+  async function deleteSelf(id) {
+    if (!confirm("Delete your account? This signs you out everywhere.")) return;
+    try {
+      await api("DELETE", `/api/users/${id}`);
+      currentUser = null;
+      renderMe();
+      await loadUsers();
+    } catch (err) {
+      showError(document.getElementById("users-error"), err);
+    }
+  }
+
+  function onSubmit(id, handler) {
+    const form = document.getElementById(id);
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const button = form.querySelector("button");
+      showError(formError(form), null);
+      button.disabled = true;
+      try {
+        await handler(Object.fromEntries(new FormData(form)), form);
+      } catch (err) {
+        showError(formError(form), err);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  }
+
+  onSubmit("sign-up", async (values, form) => {
+    currentUser = await api("POST", "/api/auth/sign-up", values);
+    form.reset();
+    renderMe();
+    await loadUsers();
+  });
+
+  onSubmit("sign-in", async (values, form) => {
+    currentUser = await api("POST", "/api/auth/sign-in", values);
+    form.reset();
+    renderMe();
+    await loadUsers();
+  });
+
+  document.getElementById("sign-out").addEventListener("click", async () => {
+    try {
+      await api("POST", "/api/auth/sign-out");
+    } catch (err) {
+      if (err.status !== 401) return showError(document.getElementById("me-error"), err);
+    }
+    currentUser = null;
+    renderMe();
+    await loadUsers();
+  });
+
+  document.getElementById("refresh-users").addEventListener("click", loadUsers);
+
+  onSubmit("job-form", async (values) => {
+    const { jobId } = await api("POST", "/api/example/jobs", values);
+    startPolling(jobId);
+  });
+
+  function startPolling(jobId) {
+    clearTimeout(pollTimer);
+    const box = document.getElementById("job-status");
+    const reason = document.getElementById("job-reason");
+    box.hidden = false;
+    document.getElementById("job-id").textContent = jobId;
+    document.getElementById("job-state").textContent = "queued";
+    document.getElementById("job-progress").value = 0;
+    showError(reason, null);
+
+    const tick = async () => {
+      try {
+        const job = await api("GET", `/api/example/jobs/${encodeURIComponent(jobId)}`);
+        document.getElementById("job-state").textContent = job.state;
+        document.getElementById("job-progress").value = typeof job.progress === "number" ? job.progress : 0;
+        if (job.state === "completed") return;
+        if (job.state === "failed") return showError(reason, new Error(job.failedReason || "Job failed"));
+      } catch (err) {
+        return showError(reason, err);
+      }
+      pollTimer = setTimeout(tick, 1000);
+    };
+    tick();
+  }
+
+  loadMe();
+</script>
+</body>
+</html>

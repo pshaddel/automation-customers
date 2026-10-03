@@ -31,7 +31,7 @@ src/
   lib/                shared infra: logger (pino), errors, error-handling, redis, queue
   <domain>/           <domain>.route.ts · .service.ts · .queue.ts · .worker.ts · .seed.ts · .schema.ts · __tests__/
     auth/  users/  health/  example/
-public/index.html     static test UI (no build step)
+public/               static test UI, no build step: index.html (sign in / sign up), dashboard.html (users, jobs)
 ```
 
 Conventions:
