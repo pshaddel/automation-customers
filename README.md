@@ -62,6 +62,43 @@ curl -s localhost:3000/api/social-media/webhooks/messages -H 'content-type: appl
 
 The dummy platform calls are logged (`social_media_comment_reply_sent`, `social_media_dm_sent`), and the run with its step-by-step history shows up in the dashboard and at `GET /api/automations/:id/runs`. Event ids must be unique: re-sending the same `comment_1` is treated as a duplicate webhook.
 
+### API
+
+All `/api/automations` routes need a session and only see the caller's own automations (others' look like `404`). Full schemas: `/openapi`.
+
+| Method & path | Does |
+|---|---|
+| `GET /api/automations` | list my automations, with run counts |
+| `POST /api/automations` | create (inactive, with an empty draft) |
+| `GET /api/automations/:id` | one automation with its draft and published steps |
+| `PATCH /api/automations/:id` | rename, or turn on/off (`{ name?, active? }`); off cancels its running and waiting runs |
+| `DELETE /api/automations/:id` | soft delete; cancels its runs |
+| `POST /api/automations/:id/publish` | validate the draft and make it live; `400` lists every problem |
+| `DELETE /api/automations/:id/draft` | discard unpublished changes |
+| `GET /api/automations/:id/steps` | steps of the draft, or of the published version |
+| `POST /api/automations/:id/steps` | add a step (`{ key, stepType, label, config, next }`) |
+| `PATCH /api/automations/:id/steps/:key` | edit a step's `label`, `config` or `next` |
+| `DELETE /api/automations/:id/steps/:key` | remove a step |
+| `GET /api/automations/step-types` | step catalog with JSON Schemas for each config |
+| `GET /api/automations/:id/runs` | runs, newest first (`?limit=&before=`) |
+| `GET /api/automations/:id/runs/:runId` | one run with its context and step runs |
+| `POST /api/social-media/webhooks/comments` | simulated Instagram comment webhook (no auth) |
+| `POST /api/social-media/webhooks/messages` | simulated Instagram messaging webhook (no auth) |
+
+### Limitations
+
+The full list, with how each case is handled, is the edge-case table in [docs/automation.md](docs/automation.md#edge-cases). The main ones:
+
+- **No reply timeout:** a run whose contact never replies waits forever. Planned: an expiry on wait listeners plus one delayed job per wait.
+- **No stuck-run sweep:** if the process dies at the wrong moment (the failure handler itself failing, or a crash right after a reply resumes a run), a run can stay `running` with no job behind it. Planned: a periodic sweep.
+- **Webhooks aren't verified:** the simulated endpoints accept any caller; real ones must check `X-Hub-Signature-256`.
+- **Account ownership isn't checked:** a trigger's `accountId` is free text, so any user can listen on any account id. A real system needs a `social_accounts` table.
+- **Platform rules aren't enforced,** e.g. Instagram's messaging window after the contact's last message.
+
+### Development note
+
+After editing files in `public/`, restart `bun run dev`. The hot-reloading server keeps sending static files with their old size, so an edited page arrives cut off and its script silently fails (for example, an empty automation list).
+
 ## Authentication
 
 - **Endpoints:** `POST /api/auth/sign-up`, `POST /api/auth/sign-in`, `POST /api/auth/sign-out`.
