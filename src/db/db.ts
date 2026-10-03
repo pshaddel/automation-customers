@@ -42,3 +42,12 @@ export async function dbHealthCheck(): Promise<boolean> {
     return false;
   }
 }
+
+/** True for a Postgres unique violation (SQLSTATE 23505). */
+export function isUniqueViolation(error: unknown): boolean {
+  // Bun exposes the SQLSTATE as `errno`; `code` is Bun's own ("ERR_POSTGRES_SERVER_ERROR").
+  return (
+    error instanceof SQL.PostgresError &&
+    (error.errno === "23505" || error.code === "23505")
+  );
+}

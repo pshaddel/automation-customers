@@ -1,10 +1,18 @@
 import { Elysia } from "elysia";
-import { AppError } from "./errors";
+import { AppError, ValidationError } from "./errors";
 import { logger } from "./logger";
 
 export const errorHandling = new Elysia({ name: "error-handling" }).onError(
   { as: "global" },
   ({ code, error, set, request }) => {
+    if (error instanceof ValidationError) {
+      set.status = error.status;
+      return {
+        error: error.code,
+        message: error.message,
+        details: error.details,
+      };
+    }
     if (error instanceof AppError) {
       set.status = error.status;
       return { error: error.code, message: error.message };

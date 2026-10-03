@@ -1,5 +1,4 @@
-import { SQL } from "bun";
-import { getDb } from "../db/db";
+import { getDb, isUniqueViolation } from "../db/db";
 import { ConflictError, UnauthorizedError } from "../lib/errors";
 import {
   type CreateUserInput,
@@ -67,14 +66,6 @@ export async function deleteSession(token: string): Promise<void> {
 
 export async function deleteUserSessions(userId: string): Promise<void> {
   await getDb()`DELETE FROM sessions WHERE user_id = ${userId}`;
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  // Bun exposes the SQLSTATE as `errno`; `code` is Bun's own ("ERR_POSTGRES_SERVER_ERROR").
-  return (
-    error instanceof SQL.PostgresError &&
-    (error.errno === "23505" || error.code === "23505")
-  );
 }
 
 export async function signUp(

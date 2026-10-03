@@ -3,10 +3,612 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Dashboard</title>
+<title>Automations</title>
 <link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: light dark; --bg: #f4f4f6; --card: #fff; --text: #18181b; --muted: #71717a;
+    --line: #e4e4e7; --accent: #4f46e5; --error: #dc2626; --ok: #16a34a; --warn: #d97706; --soft: #f4f4f5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f0f12; --card: #18181c; --text: #f4f4f5; --muted: #a1a1aa; --line: #2a2a30;
+      --accent: #818cf8; --error: #f87171; --ok: #4ade80; --warn: #fbbf24; --soft: #222228; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--line);
+    background: var(--card); }
+  header h1 { font-size: 17px; margin: 0; flex: 1; }
+  header span { color: var(--muted); }
+  .layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 16px; padding: 16px 20px;
+    max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 860px) { .layout { grid-template-columns: minmax(0, 1fr); padding: 16px; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; min-width: 0; }
+  .stack { display: grid; gap: 16px; align-content: start; min-width: 0; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  h3 { font-size: 13px; margin: 16px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  form { display: grid; gap: 8px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .row > * { flex: 1; min-width: 0; }
+  .row > button, .row > .badge { flex: 0 0 auto; }
+  .badges { display: flex; gap: 4px; flex-wrap: wrap; }
+  label { display: grid; gap: 3px; font-size: 12px; font-weight: 500; color: var(--muted); }
+  input, select, textarea { font: inherit; color: var(--text); background: transparent; border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 9px; width: 100%; }
+  textarea { font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 96px; resize: vertical; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 8px; padding: 7px 12px; cursor: pointer;
+    background: var(--accent); color: #fff; white-space: nowrap; flex: 0 0 auto; }
+  button.secondary { background: var(--soft); color: var(--text); border: 1px solid var(--line); }
+  button.danger { background: transparent; color: var(--error); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  .link { background: none; color: var(--accent); padding: 0; font-weight: 500; border: 0; }
+  .list { display: grid; gap: 6px; margin-top: 12px; }
+  .item { text-align: left; background: transparent; color: var(--text); border: 1px solid var(--line);
+    padding: 10px; border-radius: 10px; font-weight: 400; display: grid; gap: 2px; width: 100%; }
+  .item.selected { border-color: var(--accent); outline: 1px solid var(--accent); }
+  .item strong { font-size: 14px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px;
+    background: var(--soft); color: var(--muted); border: 1px solid var(--line); }
+  .badge.on, .badge.completed, .badge.succeeded { color: var(--ok); }
+  .badge.waiting, .badge.running { color: var(--warn); }
+  .badge.failed, .badge.cancelled { color: var(--error); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td code, .mono { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .scroll { overflow-x: auto; }
+  .error { color: var(--error); font-size: 13px; margin: 0; white-space: pre-wrap; }
+  .problems { margin: 8px 0 0; padding-left: 18px; color: var(--error); font-size: 13px; }
+  .empty { color: var(--muted); padding: 12px 0; }
+  details { border-bottom: 1px solid var(--line); padding: 8px 0; }
+  summary { cursor: pointer; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  pre { background: var(--soft); border-radius: 8px; padding: 8px; overflow-x: auto; font-size: 12px; margin: 6px 0 0; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  [hidden] { display: none !important; }
+</style>
 </head>
 <body>
-<!-- Placeholder for the future dashboard. -->
+<header>
+  <h1>Automations</h1>
+  <span id="who"></span>
+  <a href="/openapi" class="muted">API docs</a>
+  <button type="button" class="secondary" id="sign-out">Sign out</button>
+</header>
+
+<div class="layout">
+  <aside class="stack">
+    <section class="card">
+      <h2>My automations</h2>
+      <form id="create-form" class="row">
+        <input name="name" placeholder="New automation name" required maxlength="200">
+        <button type="submit">Create</button>
+      </form>
+      <div class="list" id="automation-list"></div>
+    </section>
+  </aside>
+
+  <main class="stack">
+    <section class="card" id="empty-state">
+      <p class="empty">Create or select an automation to edit its steps.</p>
+    </section>
+
+    <section class="card" id="editor" hidden>
+      <div class="row">
+        <div>
+          <h2 id="automation-name" style="margin:0">Automation</h2>
+          <div class="muted" id="automation-meta"></div>
+        </div>
+        <button type="button" class="secondary" id="sample-trigger" title="Sends a comment that matches the published entry trigger, from a new contact">Send sample trigger</button>
+        <button type="button" class="secondary" id="toggle-active"></button>
+        <button type="button" id="publish">Publish</button>
+        <button type="button" class="secondary" id="discard" hidden>Discard draft</button>
+        <button type="button" class="danger" id="delete">Delete</button>
+      </div>
+      <p class="error" id="editor-error"></p>
+      <ul class="problems" id="problems" hidden></ul>
+
+      <h3 id="steps-title">Steps</h3>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Key</th><th>Type</th><th>Label</th><th>Config</th><th>Next</th><th></th></tr></thead>
+          <tbody id="steps"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="no-steps" hidden>No steps yet. Add one below, or
+        <button type="button" class="link" id="load-example">load the brief's "pricing" example</button>.</p>
+
+      <h3 id="step-form-title">Add a step</h3>
+      <form id="step-form">
+        <div class="row">
+          <label>Key <input name="key" required pattern="[a-z][a-z0-9_]*" placeholder="e.g. ask"></label>
+          <label>Type <select name="stepType" id="step-type"></select></label>
+          <label>Label <input name="label" required maxlength="200"></label>
+        </div>
+        <div class="muted" id="step-type-help"></div>
+        <div class="row">
+          <label>Config (JSON) <textarea name="config" spellcheck="false"></textarea></label>
+          <label>Next (JSON: outcome → step key) <textarea name="next" spellcheck="false">{}</textarea></label>
+        </div>
+        <div class="row" style="justify-content:flex-end">
+          <p class="error" id="step-error"></p>
+          <button type="button" class="secondary" id="cancel-edit" hidden>Cancel</button>
+          <button type="submit" id="step-submit">Add step</button>
+        </div>
+      </form>
+    </section>
+
+    <div class="grid2" id="lower" hidden>
+      <section class="card">
+        <h2>Runs <span class="muted">(refreshes every 2s)</span></h2>
+        <div id="runs"></div>
+      </section>
+
+      <section class="card">
+        <h2>Simulate Instagram</h2>
+        <p class="muted" style="margin:0 0 8px">Posts Instagram-shaped bodies to the webhook endpoints.</p>
+        <form id="sim-comment">
+          <h3 style="margin-top:0">Comment</h3>
+          <div class="row">
+            <label>Account id <input name="accountId" required></label>
+            <label>Post id <input name="postId" value="post_1" required></label>
+          </div>
+          <div class="row">
+            <label>Contact id <input name="contactId" value="contact_1" required></label>
+            <label>Text <input name="text" value="What's the pricing?" required></label>
+          </div>
+          <button type="submit">Send comment</button>
+        </form>
+        <form id="sim-message">
+          <h3>Direct message</h3>
+          <div class="row">
+            <label>Account id <input name="accountId" required></label>
+            <label>Contact id <input name="contactId" value="contact_1" required></label>
+          </div>
+          <label>Text <input name="text" value="sure, it's me@example.com" required></label>
+          <button type="submit">Send message</button>
+        </form>
+        <p class="muted" id="sim-result"></p>
+      </section>
+    </div>
+  </main>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const state = { automations: [], selectedId: null, detail: null, stepTypes: [], editingKey: null, openRuns: new Set() };
+
+  async function api(method, path, body) {
+    const res = await fetch(path, {
+      method,
+      headers: body === undefined ? {} : { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (res.status === 401) { location.href = "/"; throw new Error("Signed out"); }
+    const data = res.status === 204 ? null : await res.json().catch(() => null);
+    if (!res.ok) {
+      const err = new Error(data?.message || `Request failed (${res.status})`);
+      err.details = data?.details;
+      throw err;
+    }
+    return data;
+  }
+
+  /** Builds an element; children may be strings (set as text, never HTML). */
+  function h(tag, props = {}, ...children) {
+    const el = document.createElement(tag);
+    for (const [k, v] of Object.entries(props)) {
+      if (k === "class") el.className = v;
+      else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+      else el.setAttribute(k, v);
+    }
+    for (const c of children.flat()) if (c !== null && c !== undefined) el.append(c);
+    return el;
+  }
+  const badge = (text, cls = text) => h("span", { class: `badge ${cls}` }, text);
+  const json = (v) => JSON.stringify(v, null, 2);
+  const ago = (iso) => new Date(iso).toLocaleTimeString();
+
+  function showError(id, err) {
+    $(id).textContent = err ? err.message : "";
+  }
+
+  // ---- Automations list ----
+
+  async function loadAutomations() {
+    state.automations = await api("GET", "/api/automations");
+    renderList();
+  }
+
+  function renderList() {
+    const list = $("automation-list");
+    list.replaceChildren();
+    if (state.automations.length === 0) list.append(h("p", { class: "empty" }, "No automations yet."));
+    for (const a of state.automations) {
+      const r = a.runs;
+      list.append(h("button", {
+        type: "button",
+        class: `item ${a.id === state.selectedId ? "selected" : ""}`,
+        onclick: () => select(a.id),
+      },
+        h("strong", {}, a.name),
+        h("span", { class: "badges" },
+          badge(a.active ? "on" : "off", a.active ? "on" : ""),
+          a.publishedVersion ? badge(`v${a.publishedVersion}`, "") : badge("unpublished", ""),
+          a.hasDraft && a.publishedVersion ? badge("draft", "waiting") : null),
+        h("span", { class: "muted" }, `${r.waiting} waiting · ${r.running} running · ${r.completed} done · ${r.failed} failed`),
+      ));
+    }
+  }
+
+  $("create-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const name = e.target.name.value.trim();
+    const created = await api("POST", "/api/automations", { name });
+    e.target.reset();
+    await loadAutomations();
+    await select(created.id);
+  };
+
+  // ---- Editor ----
+
+  async function select(id) {
+    state.selectedId = id;
+    state.editingKey = null;
+    state.openRuns.clear();
+    $("problems").hidden = true;
+    showError("editor-error", null);
+    resetStepForm();
+    renderList();
+    await refreshDetail();
+    await loadRuns();
+  }
+
+  async function refreshDetail() {
+    if (!state.selectedId) return;
+    state.detail = await api("GET", `/api/automations/${state.selectedId}`);
+    renderEditor();
+  }
+
+  function editableSteps() {
+    const d = state.detail;
+    return (d.draft ?? d.published)?.steps ?? [];
+  }
+
+  function renderEditor() {
+    const d = state.detail;
+    $("empty-state").hidden = true;
+    $("editor").hidden = false;
+    $("lower").hidden = false;
+    $("automation-name").textContent = d.name;
+    $("automation-meta").textContent = [
+      d.active ? "On" : "Off",
+      d.publishedVersion ? `published v${d.publishedVersion}` : "never published",
+      d.draft ? `editing draft v${d.draft.version}` : "no unpublished changes",
+    ].join(" · ");
+    $("toggle-active").textContent = d.active ? "Turn off" : "Turn on";
+    $("sample-trigger").disabled = !(d.active && d.published);
+    $("sample-trigger").title = d.active && d.published
+      ? "Sends a comment that matches the published entry trigger, from a new contact"
+      : "Publish and turn the automation on first";
+    $("publish").disabled = !d.draft;
+    $("discard").hidden = !(d.draft && d.published);
+    $("steps-title").textContent = d.draft ? `Steps (draft v${d.draft.version})` : `Steps (published v${d.publishedVersion})`;
+
+    const steps = editableSteps();
+    $("no-steps").hidden = steps.length > 0;
+    $("steps").replaceChildren(...steps.map((s) => h("tr", {},
+      h("td", { style: "white-space:nowrap" }, h("code", {}, s.key)),
+      h("td", {}, s.stepType),
+      h("td", {}, s.label),
+      h("td", {}, h("code", {}, JSON.stringify(s.config))),
+      h("td", {}, h("code", {}, JSON.stringify(s.next))),
+      h("td", { style: "white-space:nowrap" },
+        h("button", { type: "button", class: "link", onclick: () => editStep(s) }, "Edit"), " ",
+        h("button", { type: "button", class: "link", style: "color:var(--error)", onclick: () => removeStep(s.key) }, "Remove")),
+    )));
+
+    for (const form of [$("sim-comment"), $("sim-message")])
+      if (!form.accountId.value) form.accountId.value = entryAccountId() ?? "";
+  }
+
+  function entryAccountId() {
+    const entry = editableSteps().find((s) => s.stepType === "comment_received");
+    return entry?.config?.accountId;
+  }
+
+  async function action(fn) {
+    showError("editor-error", null);
+    $("problems").hidden = true;
+    try {
+      await fn();
+    } catch (err) {
+      showError("editor-error", err);
+      if (err.details?.length) {
+        $("problems").replaceChildren(...err.details.map((p) => h("li", {}, p.stepKey ? `${p.stepKey}: ${p.problem}` : p.problem)));
+        $("problems").hidden = false;
+      }
+    }
+    await refreshDetail().catch(() => {});
+    await loadAutomations().catch(() => {});
+  }
+
+  $("toggle-active").onclick = () => action(() => api("PATCH", `/api/automations/${state.selectedId}`, { active: !state.detail.active }));
+  $("publish").onclick = () => action(() => api("POST", `/api/automations/${state.selectedId}/publish`));
+  $("discard").onclick = () => action(() => api("DELETE", `/api/automations/${state.selectedId}/draft`));
+  $("delete").onclick = async () => {
+    if (!confirm(`Delete "${state.detail.name}"? Its running and waiting runs are cancelled.`)) return;
+    await api("DELETE", `/api/automations/${state.selectedId}`);
+    state.selectedId = null;
+    state.detail = null;
+    $("editor").hidden = true;
+    $("lower").hidden = true;
+    $("empty-state").hidden = false;
+    await loadAutomations();
+  };
+
+  $("load-example").onclick = () => action(async () => {
+    const accountId = prompt("Instagram account id the automation listens on:", "acc_demo");
+    if (!accountId) return;
+    for (const step of pricingExample(accountId))
+      await api("POST", `/api/automations/${state.selectedId}/steps`, step);
+  });
+
+  function pricingExample(accountId) {
+    const contact = { accountId: "{{trigger.accountId}}", contactId: "{{trigger.contactId}}" };
+    return [
+      { key: "trigger", stepType: "comment_received", label: "Comment contains 'pricing'",
+        config: { accountId, matchMode: "contains", keyword: "pricing" }, next: { ok: "reply" } },
+      { key: "reply", stepType: "reply_to_comment", label: "Reply to the comment",
+        config: { accountId: "{{trigger.accountId}}", commentId: "{{trigger.commentId}}", text: "Sent you a DM!" }, next: { ok: "ask" } },
+      { key: "ask", stepType: "send_dm", label: "Ask for their email",
+        config: { ...contact, text: "Hey! What's your email address?" }, next: { ok: "wait_email" } },
+      { key: "wait_email", stepType: "message_received", label: "Wait for an email address",
+        config: { ...contact, match: "email" }, next: { ok: "send_link" } },
+      { key: "send_link", stepType: "send_dm", label: "Send the pricing link",
+        config: { ...contact, text: "Thanks {{steps.wait_email.email}}! Here's our pricing: https://example.com/pricing" }, next: {} },
+    ];
+  }
+
+  // ---- Step form ----
+
+  /** Required config fields with placeholder values; optional ones are listed in the help text. */
+  function exampleConfig(type) {
+    const schema = type?.inputSchema ?? {};
+    const required = new Set(schema.required ?? []);
+    return Object.fromEntries(Object.entries(schema.properties ?? {})
+      .filter(([k]) => required.has(k))
+      .map(([k, s]) => [k, s.enum ? s.enum[0] : ""]));
+  }
+
+  function optionalFields(type) {
+    const required = new Set(type.inputSchema?.required ?? []);
+    const optional = Object.keys(type.inputSchema?.properties ?? {}).filter((k) => !required.has(k));
+    return optional.length ? ` Optional config: ${optional.join(", ")}.` : "";
+  }
+
+  function renderStepTypeHelp() {
+    const type = state.stepTypes.find((t) => t.type === $("step-type").value);
+    $("step-type-help").textContent = type
+      ? `${type.description} Outcomes: ${type.outcomes.join(", ")}${type.kind === "trigger" ? ` · trigger (${type.position})` : ""}.${optionalFields(type)} Templates: {{trigger.*}}, {{steps.<key>.*}}.`
+      : "";
+  }
+
+  $("step-type").onchange = () => {
+    renderStepTypeHelp();
+    if (!state.editingKey) {
+      const type = state.stepTypes.find((t) => t.type === $("step-type").value);
+      $("step-form").config.value = json(exampleConfig(type));
+    }
+  };
+
+  function resetStepForm() {
+    state.editingKey = null;
+    const form = $("step-form");
+    form.reset();
+    form.key.disabled = false;
+    form.stepType.disabled = false;
+    form.next.value = "{}";
+    $("step-form-title").textContent = "Add a step";
+    $("step-submit").textContent = "Add step";
+    $("cancel-edit").hidden = true;
+    showError("step-error", null);
+    $("step-type").onchange();
+  }
+
+  function editStep(step) {
+    state.editingKey = step.key;
+    const form = $("step-form");
+    form.key.value = step.key;
+    form.key.disabled = true;
+    form.stepType.value = step.stepType;
+    form.stepType.disabled = true;
+    form.label.value = step.label;
+    form.config.value = json(step.config);
+    form.next.value = json(step.next);
+    $("step-form-title").textContent = `Edit step "${step.key}"`;
+    $("step-submit").textContent = "Save step";
+    $("cancel-edit").hidden = false;
+    renderStepTypeHelp();
+    form.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  $("cancel-edit").onclick = resetStepForm;
+
+  async function removeStep(key) {
+    await action(() => api("DELETE", `/api/automations/${state.selectedId}/steps/${encodeURIComponent(key)}`));
+  }
+
+  $("step-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    showError("step-error", null);
+    let config;
+    let next;
+    try {
+      config = JSON.parse(form.config.value || "{}");
+      next = JSON.parse(form.next.value || "{}");
+    } catch {
+      showError("step-error", new Error("Config and next must be valid JSON"));
+      return;
+    }
+    try {
+      if (state.editingKey) {
+        await api("PATCH", `/api/automations/${state.selectedId}/steps/${encodeURIComponent(state.editingKey)}`,
+          { label: form.label.value, config, next });
+      } else {
+        await api("POST", `/api/automations/${state.selectedId}/steps`,
+          { key: form.key.value, stepType: form.stepType.value, label: form.label.value, config, next });
+      }
+      resetStepForm();
+      await refreshDetail();
+      await loadAutomations();
+    } catch (err) {
+      showError("step-error", err);
+    }
+  };
+
+  // ---- Runs ----
+
+  async function loadRuns() {
+    if (!state.selectedId) return;
+    const automationId = state.selectedId;
+    const runs = await api("GET", `/api/automations/${automationId}/runs?limit=20`);
+    const details = await Promise.all(runs.filter((r) => state.openRuns.has(r.id))
+      .map((r) => api("GET", `/api/automations/${automationId}/runs/${r.id}`)));
+    if (automationId !== state.selectedId) return;
+    const byId = new Map(details.map((d) => [d.id, d]));
+    const container = $("runs");
+    if (runs.length === 0) {
+      container.replaceChildren(h("p", { class: "empty" }, "No runs yet. Turn the automation on and send a matching comment."));
+      return;
+    }
+    container.replaceChildren(...runs.map((run) => {
+      const el = h("details", { "data-id": run.id },
+        h("summary", {},
+          badge(run.status),
+          h("span", { class: "mono" }, run.subjectKey),
+          h("span", { class: "muted" }, `${ago(run.startedAt)} · ${run.stepCount} steps${run.currentStepKey ? ` · at ${run.currentStepKey}` : ""}`),
+          run.error ? h("span", { class: "error" }, run.error) : null,
+          run.status === "waiting"
+            ? h("button", { type: "button", class: "secondary", onclick: (e) => { e.preventDefault(); e.stopPropagation(); sendSampleReply(run.id); } }, "Send sample reply")
+            : null),
+        renderRunDetail(byId.get(run.id)));
+      el.open = state.openRuns.has(run.id);
+      el.addEventListener("toggle", () => {
+        if (el.open) { state.openRuns.add(run.id); loadRuns(); } else state.openRuns.delete(run.id);
+      });
+      return el;
+    }));
+  }
+
+  function renderRunDetail(detail) {
+    if (!detail) return h("p", { class: "muted" }, "Loading…");
+    return h("div", { class: "scroll" },
+      h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "#"), h("th", {}, "Step"), h("th", {}, "Status"), h("th", {}, "Output / error"))),
+        h("tbody", {}, ...detail.steps.map((s) => h("tr", {},
+          h("td", {}, String(s.sequence)),
+          h("td", {}, h("code", {}, s.stepKey), h("div", { class: "muted" }, s.stepType)),
+          h("td", {}, badge(s.status), s.attempt > 1 ? h("div", { class: "muted" }, `attempt ${s.attempt}`) : null),
+          h("td", {}, s.error ? h("span", { class: "error" }, s.error) : h("code", {}, JSON.stringify(s.output))),
+        )))),
+      h("pre", {}, json(detail.context)));
+  }
+
+  setInterval(() => {
+    if (document.hidden || !state.selectedId) return;
+    loadRuns().catch(() => {});
+    loadAutomations().catch(() => {});
+  }, 2000);
+
+  // ---- Simulator ----
+
+  async function simulate(path, body, note = "") {
+    try {
+      const res = await api("POST", path, body);
+      $("sim-result").textContent = `${note} Accepted ${res.received} event(s) at ${new Date().toLocaleTimeString()}.`.trim();
+      setTimeout(() => loadRuns().catch(() => {}), 500);
+    } catch (err) {
+      $("sim-result").textContent = err.message;
+    }
+  }
+
+  const uid = (p) => `${p}_${crypto.randomUUID().slice(0, 8)}`;
+
+  const commentBody = ({ accountId, postId, contactId, text }) => ({
+    object: "instagram",
+    entry: [{ id: accountId, time: Date.now(), changes: [{ field: "comments",
+      value: { id: uid("comment"), text, from: { id: contactId }, media: { id: postId } } }] }],
+  });
+
+  const messageBody = ({ accountId, contactId, text }) => ({
+    object: "instagram",
+    entry: [{ id: accountId, time: Date.now(), messaging: [{ sender: { id: contactId },
+      recipient: { id: accountId }, timestamp: Date.now(), message: { mid: uid("mid"), text } }] }],
+  });
+
+  /** A comment that matches the published entry trigger's config. */
+  function sampleComment(config) {
+    const text = config.matchMode === "any" ? "Sample comment"
+      : config.matchMode === "exact" ? config.keyword
+      : `Hi! Can you tell me about ${config.keyword}?`;
+    return { accountId: config.accountId, postId: config.postId || "post_sample", contactId: uid("contact"), text };
+  }
+
+  $("sample-trigger").onclick = async () => {
+    const entryTypes = new Set(state.stepTypes.filter((t) => t.kind === "trigger" && t.position === "entry").map((t) => t.type));
+    const entry = state.detail.published?.steps.find((s) => entryTypes.has(s.stepType));
+    if (!entry) return;
+    const comment = sampleComment(entry.config);
+    // Point the manual simulator at the same contact, so follow-up DMs reach this run.
+    for (const form of [$("sim-comment"), $("sim-message")]) {
+      form.accountId.value = comment.accountId;
+      form.contactId.value = comment.contactId;
+    }
+    await simulate("/api/social-media/webhooks/comments", commentBody(comment),
+      `Sample comment "${comment.text}" sent from ${comment.contactId}.`);
+  };
+
+  /** Replies as the run's contact, using the input its waiting trigger is listening with. */
+  async function sendSampleReply(runId) {
+    const run = await api("GET", `/api/automations/${state.selectedId}/runs/${runId}`);
+    const waiting = run.steps.find((s) => s.status === "waiting");
+    if (!waiting?.input?.accountId || !waiting.input.contactId) {
+      $("sim-result").textContent = "This run isn't waiting for a direct message.";
+      return;
+    }
+    const text = waiting.input.match === "email" ? "Sure, it's sample@example.com" : "Sample reply";
+    await simulate("/api/social-media/webhooks/messages",
+      messageBody({ accountId: waiting.input.accountId, contactId: waiting.input.contactId, text }),
+      `Sample reply "${text}" sent from ${waiting.input.contactId}.`);
+  }
+
+  $("sim-comment").onsubmit = (e) => {
+    e.preventDefault();
+    simulate("/api/social-media/webhooks/comments", commentBody(Object.fromEntries(new FormData(e.target))));
+  };
+
+  $("sim-message").onsubmit = (e) => {
+    e.preventDefault();
+    simulate("/api/social-media/webhooks/messages", messageBody(Object.fromEntries(new FormData(e.target))));
+  };
+
+  // ---- Boot ----
+
+  $("sign-out").onclick = async () => {
+    await api("POST", "/api/auth/sign-out", {}).catch(() => {});
+    location.href = "/";
+  };
+
+  (async () => {
+    const me = await api("GET", "/api/me");
+    $("who").textContent = `@${me.username}`;
+    state.stepTypes = await api("GET", "/api/automations/step-types");
+    $("step-type").replaceChildren(...state.stepTypes.map((t) => h("option", { value: t.type }, `${t.type} (${t.kind})`)));
+    resetStepForm();
+    await loadAutomations();
+    if (state.automations[0]) await select(state.automations[0].id);
+  })();
+</script>
 </body>
 </html>

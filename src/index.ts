@@ -3,6 +3,7 @@ import { openapi } from "@elysiajs/openapi";
 import { staticPlugin } from "@elysiajs/static";
 import { Elysia } from "elysia";
 import { authModule } from "./auth/auth.route";
+import { automationsModule } from "./automations/automations.route";
 import { loadConfig } from "./config/config";
 import { closeDb, initDb, testDbConnectionOnStartup } from "./db/db";
 import { runMigrations } from "./db/migrate";
@@ -12,6 +13,7 @@ import { errorHandling } from "./lib/error-handling";
 import { logger } from "./lib/logger";
 import { closeQueues } from "./lib/queue";
 import { closeRedis, testRedisConnectionOnStartup } from "./lib/redis";
+import { webhooksModule } from "./social-media/webhooks.route";
 import { usersModule } from "./users/users.route";
 import { startWorkers } from "./workers";
 
@@ -43,6 +45,8 @@ const app = new Elysia()
   .use(authModule())
   .use(usersModule())
   .use(exampleModule())
+  .use(automationsModule())
+  .use(webhooksModule())
   .use(
     await staticPlugin({
       assets: "public",

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Backend for comment-triggered social automations (take-home brief: `docs/CHALLENGE.md`).
+Backend for comment-triggered social automations (take-home brief: `docs/CHALLENGE.md`; design, data model and reasoning: `docs/automation.md`).
 Bun + Elysia · Postgres 18 via Bun's native `SQL` (no ORM) · BullMQ + Redis 8 · hand-rolled username/password auth.
 
 ## Commands
@@ -31,7 +31,11 @@ src/
   lib/                shared infra: logger (pino), errors, error-handling, redis, queue
   <domain>/           <domain>.route.ts · .service.ts · .queue.ts · .worker.ts · .seed.ts · .schema.ts · __tests__/
     auth/  users/  health/  example/
-public/               static test UI, no build step: index.html (sign in / sign up), dashboard.html (empty placeholder)
+    automations/      engine + API: automation-events.{queue,worker}, automation-steps.{queue,worker} (step runner),
+                      automations.{route,service,schema,seed}, runs.service, validation, template,
+                      steps/<step_type>/ (one folder per step implementation) + steps/registry.ts
+    social-media/     simulated Instagram webhooks (webhooks.{route,service,schema}) and the dummy client (sendDm, commentOnPost)
+public/               static test UI, no build step: index.html (sign in / sign up), dashboard.html (automations, runs, webhook simulator)
 ```
 
 Conventions:
@@ -73,6 +77,12 @@ Each domain owns its queue and worker. To add background work (e.g. `file-handli
 Job processors must be **idempotent and retry-safe**: a job may run more than once because of retries or stalled-job recovery. Throw to trigger a retry, and keep side effects guarded by DB state.
 
 Workers run inside the API process when `RUN_WORKERS_IN_PROCESS=true` (dev default). In production, set it to `false` and run `bun run worker` as its own process, so you can scale it independently. Both entrypoints shut down gracefully on SIGTERM/SIGINT: workers first, then queues, Redis, and the DB.
+
+### Automation steps
+
+- `step_type` values (`comment_received`, `reply_to_comment`, `send_dm`, `message_received`) are stored in the database: **never rename one**. Each matches its folder under `src/automations/steps/` and is mapped only in `steps/registry.ts`.
+- To add a step type: a new `steps/<step_type>/<step_type>.step.ts` implementing `ActionStep` or `TriggerStep` (`steps/step.types.ts`), register it, add unit tests. Implementations stay pure (input → output or throw); the step runner (`automation-steps.worker.ts`) owns every DB write, retry and failure decision.
+- An incompatible change to a step is a new type (e.g. `send_dm_v2`), so published versions keep working.
 
 Sample flow: `POST /api/example/jobs` enqueues a job, `GET /api/example/jobs/:id` returns its state and progress (the UI polls this), and `src/example/example.worker.ts` processes it.
 

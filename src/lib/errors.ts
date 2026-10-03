@@ -26,3 +26,14 @@ export class UnauthorizedError extends AppError {
     super(message, 401, "UNAUTHORIZED");
   }
 }
+
+export type ValidationProblem = { stepKey?: string; problem: string };
+
+export class ValidationError extends AppError {
+  constructor(
+    message = "Validation failed",
+    public readonly details: ValidationProblem[] = [],
+  ) {
+    super(message, 400, "VALIDATION_ERROR");
+  }
+}
