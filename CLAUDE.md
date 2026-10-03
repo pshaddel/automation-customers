@@ -1,0 +1,82 @@
+# CLAUDE.md
+
+Backend for comment-triggered social automations (take-home brief: `docs/CHALLENGE.md`).
+Bun + Elysia · Postgres 18 via Bun's native `SQL` (no ORM) · BullMQ + Redis 8 · hand-rolled username/password auth.
+
+## Commands
+
+```sh
+docker compose up -d        # postgres :5491, redis :6391
+bun run dev                 # API + in-process workers, http://localhost:3000 (UI), /openapi (docs)
+bun run worker              # standalone worker process
+bun run db:migrate | db:seed | db:reset
+bun test                    # integration tests hit the docker postgres/redis; suites skip if unreachable
+bun run typecheck && bun run lint
+```
+
+Run `bun test`, `bun run typecheck` and `bun run lint` before considering work done.
+
+## Project structure
+
+Code is organised **by domain**, never by technical layer. **Do not** create global `workers/`, `queues/`, `modules/`, `services/` or `routes/` folders.
+
+```
+src/
+  index.ts            API entry: config → db → migrations → redis → (workers) → Elysia app
+  worker.ts           standalone worker entry (same boot, no HTTP)
+  workers.ts          worker registry only: starts each domain's start*Worker(), closeAll()
+  config/             zod env schema (env.ts) + loadConfig()/getConfig()
+  db/                 db.ts (initDb/getDb), migrate.ts, seed.ts, reset.ts
+  migrations/         NNN_snake_case.sql (forward-only)
+  lib/                shared infra: logger (pino), errors, error-handling, redis, queue
+  <domain>/           <domain>.route.ts · .service.ts · .queue.ts · .worker.ts · .seed.ts · .schema.ts · __tests__/
+    auth/  users/  health/  example/
+public/index.html     static test UI (no build step)
+```
+
+Conventions:
+- **Routes:** a factory `export function usersModule() { return new Elysia({ prefix, detail: { tags } }) ... }`, registered in `src/index.ts`. Validate inputs and describe responses with Elysia `t` so OpenAPI stays accurate.
+- **Services:** plain async functions. They get the DB through `getDb()` (or an optional `db` parameter so seeds and transactions can pass one in).
+- **SQL:** Bun tagged templates, `const [row] = await getDb()<Row[]>\`SELECT ... WHERE id = ${id}\``. Map snake_case rows to camelCase at the service boundary. Use `getDb().begin(async (tx) => ...)` for multi-statement writes. Don't call `.begin()` on a `db.reserve()` connection: in Bun 1.3 failures surface as unhandled rejections.
+- **Errors:** throw `AppError` subclasses from `src/lib/errors.ts`. `src/lib/error-handling.ts` maps them to `{ error, message }` + status.
+- **Logging:** structured, `logger.info({ event: "snake_case_event", source: "<component>", ...ids })`.
+- **Auth:** add `{ auth: true }` to a route to require a session. The handler then receives a typed `user` (`src/auth/auth.plugin.ts`).
+- **Migrations:** new `src/migrations/NNN_*.sql` file, never edit an applied one. Each file runs in one transaction, so no `CREATE INDEX CONCURRENTLY`. Tables get `created_at`/`updated_at` (with the `set_updated_at()` trigger from `001_init.sql`) and soft-delete via `deleted_at`.
+- **Seeds:** `src/<domain>/<domain>.seed.ts` exporting `order: number` and `run(db)`. Seeds must be idempotent.
+
+## Async tasks (BullMQ)
+
+Shared pieces (`src/lib`):
+- **`redis.ts`:** one lazy ioredis connection (`maxRetriesPerRequest: null`, required by BullMQ workers), shared by all queues and workers. The startup ping and health ping have timeouts.
+- **`queue.ts`:** `createQueue<TData, TResult>(name)` creates or reuses a typed queue with `DEFAULT_JOB_OPTIONS`:
+  - 3 attempts with exponential backoff, starting at 1s
+  - completed jobs kept for 1h (max 1000) so their status can be polled
+  - failed jobs kept for 7 days
+
+  `closeQueues()` closes every queue on shutdown.
+
+Each domain owns its queue and worker. To add background work (e.g. `file-handling`):
+1. **`src/file-handling/file-handling.queue.ts`:**
+   - queue name constant
+   - typed `JobData` interface
+   - `getFileHandlingQueue()` via `createQueue`
+   - `enqueueX(data, jobId?)` helper. Pass a deterministic `jobId` (e.g. derived from the triggering event id) to make enqueues idempotent: BullMQ ignores a duplicate `jobId` while the job still exists.
+2. **`src/file-handling/file-handling.worker.ts`:** `startFileHandlingWorker()` (see `src/example/example.worker.ts`):
+   - `new Worker<Data, Result>(QUEUE, processor, { connection: getRedisConnection(), concurrency })`
+   - log `*_job_started` / `*_job_completed` from the processor
+   - attach `worker.on("failed")` and `worker.on("error")` handlers that log
+   - export the processor separately so it can be unit-tested
+   - accept a `queueName` override so tests run against an isolated queue
+3. **Register it** in `src/workers.ts`: start it in `startWorkers()` and close it in `closeAll()`.
+4. **Enqueue from a route or service.** Never do slow or external work inline in a request handler.
+
+Job processors must be **idempotent and retry-safe**: a job may run more than once because of retries or stalled-job recovery. Throw to trigger a retry, and keep side effects guarded by DB state.
+
+Workers run inside the API process when `RUN_WORKERS_IN_PROCESS=true` (dev default). In production, set it to `false` and run `bun run worker` as its own process, so you can scale it independently. Both entrypoints shut down gracefully on SIGTERM/SIGINT: workers first, then queues, Redis, and the DB.
+
+Sample flow: `POST /api/example/jobs` enqueues a job, `GET /api/example/jobs/:id` returns its state and progress (the UI polls this), and `src/example/example.worker.ts` processes it.
+
+## Environment notes
+
+- Env vars are validated in `src/config/env.ts`. Add new ones there and to `.env.example`. Bun auto-loads `.env`.
+- Pinned versions: `bullmq` 6.x, `ioredis` 6.x (`import { Redis } from "ioredis"`), `zod` 4, `elysia` 1.4, TypeScript 7.
