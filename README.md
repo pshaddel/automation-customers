@@ -117,3 +117,8 @@ Run status: `running ⇄ waiting → completed | failed | cancelled` (cancelled 
 - **Failures:** the step runner records the failed attempt and rethrows so BullMQ retries. On the last attempt (or an unrecoverable error such as invalid input) the run follows `next.error` if the step has one, or is marked `failed` and its listener deleted. This runs inside the job, not in an in-memory `failed` event that a crash would lose.
 - **Runaway graphs:** a loop that never ends fails the run after 50 steps. Publishing validates the graph (one entry trigger, known step types, valid configs and templates, every `next` target exists and every step is reachable).
 - **Known gap:** if the process dies at exactly the wrong moment (the failure handler failing, or a crash right after a reply resumes a run), a run can stay `running` with no job. The fix is a periodic sweep for stale runs; see [Limitations](docs/development.md#limitations).
+
+## Write-up AI Usage
+- I started with a piece of paper and pencil, drawing the steps and the flow I thought that makes sense. it was actually an advantage that I have extensively worked with n8n in the past, I re-used some of the ideas that I have seen in n8n implementation.
+- I started the project from a Bun template I use. I started to create a automation.md file to bring my ideas together. LLM was helpful to generate the code based on the current implementation, I also asked for super simple html, css, js to create a dashboard to test the flow. I also asked for some code to generate a random comment and random DM to test the flow.
+- I used claude code to steer the implementation of the code.
