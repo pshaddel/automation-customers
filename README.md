@@ -38,7 +38,7 @@ Project structure, conventions and how background jobs (BullMQ) are organised ar
 
 Design, data model, execution model, edge cases and the reasoning behind each decision: [docs/automation.md](docs/automation.md).
 
-In short: an automation is a versioned graph of steps (`comment_received` → `reply_to_comment` → `send_dm` → `message_received` → `send_dm`). Webhooks enqueue one BullMQ job per event; the event worker matches it to listeners (entry triggers start runs, wait triggers resume them); the step worker runs one job per step. Code lives in `src/automations/` (engine, API, step implementations under `steps/<step_type>/`) and `src/social-media/` (simulated webhooks and the dummy `sendDm` / `commentOnPost`).
+In short: an automation is a versioned graph of steps (`comment_received` → `reply_to_comment` → `send_dm` → `message_received` → `send_dm`). Webhooks enqueue one BullMQ job per event; the event worker matches it to listeners (entry triggers start runs, wait triggers resume them); the step worker runs one job per step; the wait-timeouts worker ends waits whose contact never replied. Code lives in `src/automations/` (engine, API, step implementations under `steps/<step_type>/`) and `src/social-media/` (simulated webhooks and the dummy `sendDm` / `commentOnPost`).
 
 ### Try the brief's flow with curl
 
@@ -60,7 +60,26 @@ curl -s localhost:3000/api/social-media/webhooks/messages -H 'content-type: appl
 }'
 ```
 
+If they never reply, the demo's wait times out after 23h (`timeoutSeconds: 82800` on `wait_email`, see below): the run sends one reminder DM and completes.
+
 The dummy platform calls are logged (`social_media_comment_reply_sent`, `social_media_dm_sent`), and the run with its step-by-step history shows up in the dashboard and at `GET /api/automations/:id/runs`. Event ids must be unique: re-sending the same `comment_1` is treated as a duplicate webhook.
+
+### Wait timeouts
+
+A `message_received` step can stop waiting after `timeoutSeconds` (1 to 86400, so at most Instagram's 24h messaging window). It then finishes with outcome `timeout` and the run follows `next.timeout`, or completes if there is none. Without `timeoutSeconds` the run waits indefinitely.
+
+```json
+{ "key": "wait_email", "stepType": "message_received",
+  "config": { "accountId": "{{trigger.accountId}}", "contactId": "{{trigger.contactId}}", "match": "email", "timeoutSeconds": 82800 },
+  "next": { "ok": "send_link", "timeout": "remind" } }
+```
+
+How it works:
+- **Deadline in Postgres:** the wait listener stores `expires_at` (`automation_triggers`). Matching ignores expired listeners, so a reply after the deadline never resumes the run, even if the timeout job runs late.
+- **Delayed job:** the step runner schedules one delayed BullMQ job per wait, on the `automation-wait-timeouts` queue, with id `timeout-<runId>-<sequence>`. When it fires, it claims the listener with `DELETE ... RETURNING`, the same way a reply does, so exactly one of them moves the run on. If a reply got there first, the job does nothing.
+- **Visibility:** waiting runs expose `waitExpiresAt` in the runs API, and the dashboard shows when they time out.
+
+Details and edge cases: [docs/automation.md → Wait timeouts](docs/automation.md#wait-timeouts).
 
 ### API
 
@@ -89,11 +108,11 @@ All `/api/automations` routes need a session and only see the caller's own autom
 
 The full list, with how each case is handled, is the edge-case table in [docs/automation.md](docs/automation.md#edge-cases). The main ones:
 
-- **No reply timeout:** a run whose contact never replies waits forever. Planned: an expiry on wait listeners plus one delayed job per wait.
-- **No stuck-run sweep:** if the process dies at the wrong moment (the failure handler itself failing, or a crash right after a reply resumes a run), a run can stay `running` with no job behind it. Planned: a periodic sweep.
+- **Timeouts are opt-in:** a wait without `timeoutSeconds` still waits forever.
+- **No stuck-run sweep:** if the process dies at the wrong moment (the failure handler itself failing, or a crash right after a reply resumes a run), a run can stay `running` with no job behind it. The same applies to a wait whose delayed timeout job is lost (e.g. Redis restarts without persistence): no reply can resume it after `expires_at`, but nothing moves it on. Planned: a periodic sweep.
 - **Webhooks aren't verified:** the simulated endpoints accept any caller; real ones must check `X-Hub-Signature-256`.
 - **Account ownership isn't checked:** a trigger's `accountId` is free text, so any user can listen on any account id. A real system needs a `social_accounts` table.
-- **Platform rules aren't enforced,** e.g. Instagram's messaging window after the contact's last message.
+- **Platform rules aren't enforced,** e.g. Instagram's messaging window after the contact's last message. Wait timeouts are capped at 24h, but nothing forces an author to set one.
 
 ### Development note
 

@@ -219,28 +219,108 @@ export async function completeStep(params: {
   });
 }
 
-/** Pauses the run on a mid-flow trigger: the step run waits and a wait listener is stored. */
+/**
+ * Pauses the run on a mid-flow trigger: the step run waits and a wait listener is stored,
+ * expiring after `timeoutSeconds` if given. Returns the listener's expiry, if it has one.
+ */
 export async function waitOnTrigger(params: {
   runId: string;
   step: Step;
   sequence: number;
   eventType: string;
   correlationKey: string;
-}): Promise<void> {
-  const { runId, step, sequence, eventType, correlationKey } = params;
-  await getDb().begin(async (tx) => {
+  timeoutSeconds: number | undefined;
+}): Promise<Date | null> {
+  const { runId, step, sequence, eventType, correlationKey, timeoutSeconds } =
+    params;
+  return getDb().begin(async (tx) => {
     const run = await lockRun(tx, runId);
-    if (run?.status !== "running") return;
+    if (run?.status !== "running") return null;
     await tx`
       UPDATE automation_step_runs SET status = 'waiting'
       WHERE run_id = ${runId} AND sequence = ${sequence}
     `;
     await tx`
-      INSERT INTO automation_triggers (automation_id, version_id, step_id, run_id, event_type, correlation_key)
-      VALUES (${run.automation_id}, ${run.version_id}, ${step.id}, ${runId}, ${eventType}, ${correlationKey})
+      INSERT INTO automation_triggers (automation_id, version_id, step_id, run_id, event_type, correlation_key, expires_at)
+      VALUES (${run.automation_id}, ${run.version_id}, ${step.id}, ${runId}, ${eventType}, ${correlationKey},
+              now() + ${timeoutSeconds ?? null}::int * interval '1 second')
       ON CONFLICT DO NOTHING
     `;
     await tx`UPDATE automation_runs SET status = 'waiting' WHERE id = ${runId}`;
+    return waitExpiry(tx, runId, step.id);
+  });
+}
+
+/** When the run's wait listener on `stepId` expires; null if it has none or never expires. */
+export async function waitExpiry(
+  db: Database,
+  runId: string,
+  stepId: string,
+): Promise<Date | null> {
+  const [row] = await db<{ expires_at: Date | null }[]>`
+    SELECT expires_at FROM automation_triggers WHERE run_id = ${runId} AND step_id = ${stepId}
+  `;
+  return row?.expires_at ?? null;
+}
+
+export const WAIT_TIMED_OUT = { timedOut: true } as const;
+
+/**
+ * Ends a wait whose listener has expired: the step run finishes with outcome `timeout`
+ * and the run follows `next.timeout`, or completes. The listener is claimed with
+ * DELETE ... RETURNING before the run is locked, the same order as resumeRun, so a reply
+ * and a timeout can't deadlock and only one of them moves the run on.
+ * Returns `early` while the listener hasn't expired yet (the caller retries), and null
+ * when there's nothing to expire: a reply or a cancellation got there first.
+ */
+export async function expireWait(params: {
+  runId: string;
+  step: Step;
+  sequence: number;
+}): Promise<
+  | { status: "expired"; nextStepId: string | null }
+  | { status: "early"; expiresAt: Date }
+  | null
+> {
+  const { runId, step, sequence } = params;
+  return getDb().begin(async (tx) => {
+    // Joining the step run at `sequence` keeps an old timeout job from expiring a later
+    // wait on the same step (a loop): that wait has a different sequence.
+    const [claimed] = await tx<{ id: string }[]>`
+      DELETE FROM automation_triggers l
+      USING automation_step_runs sr
+      WHERE l.run_id = ${runId} AND l.step_id = ${step.id} AND l.expires_at <= now()
+        AND sr.run_id = l.run_id AND sr.step_id = l.step_id
+        AND sr.sequence = ${sequence} AND sr.status = 'waiting'
+      RETURNING l.id
+    `;
+    if (!claimed) {
+      const [pending] = await tx<{ expires_at: Date }[]>`
+        SELECT l.expires_at FROM automation_triggers l
+        JOIN automation_step_runs sr
+          ON sr.run_id = l.run_id AND sr.step_id = l.step_id
+         AND sr.sequence = ${sequence} AND sr.status = 'waiting'
+        WHERE l.run_id = ${runId} AND l.step_id = ${step.id} AND l.expires_at > now()
+      `;
+      return pending
+        ? { status: "early", expiresAt: pending.expires_at }
+        : null;
+    }
+    const run = await lockRun(tx, runId);
+    if (run?.status !== "waiting") return null;
+    await tx`
+      UPDATE automation_step_runs SET
+        status = 'succeeded', output = ${WAIT_TIMED_OUT}::jsonb, outcome = 'timeout', finished_at = now()
+      WHERE run_id = ${runId} AND sequence = ${sequence}
+    `;
+    const nextStepId = await advance(
+      tx,
+      run,
+      step.key,
+      WAIT_TIMED_OUT,
+      step.next.timeout,
+    );
+    return { status: "expired", nextStepId };
   });
 }
 
@@ -312,7 +392,7 @@ export interface ListenerMatch {
 
 /**
  * Live listeners for an event: entry listeners of active automations on their current
- * version, and wait listeners of runs that are still waiting. Oldest first.
+ * version, and unexpired wait listeners of runs that are still waiting. Oldest first.
  */
 export async function findListeners(
   eventType: string,
@@ -347,7 +427,8 @@ export async function findListeners(
       AND a.deleted_at IS NULL
       AND (
         (l.run_id IS NULL AND a.active AND a.current_version_id = l.version_id)
-        OR (l.run_id IS NOT NULL AND r.status = 'waiting')
+        OR (l.run_id IS NOT NULL AND r.status = 'waiting'
+            AND (l.expires_at IS NULL OR l.expires_at > now()))
       )
     ORDER BY l.created_at, l.id
   `;
@@ -484,6 +565,8 @@ export interface RunSummary {
   currentStepKey: string | null;
   stepCount: number;
   error: string | null;
+  /** When the run's current wait times out; null if it isn't waiting or has no timeout. */
+  waitExpiresAt: string | null;
   startedAt: string;
   finishedAt: string | null;
 }
@@ -502,7 +585,10 @@ export interface StepRunView {
   finishedAt: string | null;
 }
 
-type RunSummaryRow = RunRow & { current_step_key: string | null };
+type RunSummaryRow = RunRow & {
+  current_step_key: string | null;
+  wait_expires_at: Date | null;
+};
 
 const toRunSummary = (row: RunSummaryRow): RunSummary => ({
   id: row.id,
@@ -513,6 +599,7 @@ const toRunSummary = (row: RunSummaryRow): RunSummary => ({
   currentStepKey: row.current_step_key,
   stepCount: row.step_count,
   error: row.error,
+  waitExpiresAt: row.wait_expires_at?.toISOString() ?? null,
   startedAt: row.started_at.toISOString(),
   finishedAt: row.finished_at?.toISOString() ?? null,
 });
@@ -524,9 +611,10 @@ export async function listRuns(
 ): Promise<RunSummary[]> {
   const before = opts.before ? new Date(opts.before) : new Date("9999-01-01");
   const rows = await getDb()<RunSummaryRow[]>`
-    SELECT r.*, s.key AS current_step_key
+    SELECT r.*, s.key AS current_step_key, w.expires_at AS wait_expires_at
     FROM automation_runs r
     LEFT JOIN automation_steps s ON s.id = r.current_step_id
+    LEFT JOIN automation_triggers w ON w.run_id = r.id
     WHERE r.automation_id = ${automationId} AND r.started_at < ${before}
     ORDER BY r.started_at DESC, r.id DESC
     LIMIT ${opts.limit}
@@ -539,9 +627,10 @@ export async function getRunDetail(
   runId: string,
 ): Promise<RunSummary & { context: RunContext; steps: StepRunView[] }> {
   const [row] = await getDb()<RunSummaryRow[]>`
-    SELECT r.*, s.key AS current_step_key
+    SELECT r.*, s.key AS current_step_key, w.expires_at AS wait_expires_at
     FROM automation_runs r
     LEFT JOIN automation_steps s ON s.id = r.current_step_id
+    LEFT JOIN automation_triggers w ON w.run_id = r.id
     WHERE r.id = ${runId} AND r.automation_id = ${automationId}
   `;
   if (!row) throw new NotFoundError("Run not found");

@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { MessageReceivedEvent } from "../../../../social-media/social-media.events";
-import { messageReceivedStep } from "../message_received.step";
+import {
+  MAX_WAIT_SECONDS,
+  messageReceivedInput,
+  messageReceivedStep,
+} from "../message_received.step";
 
 const event: MessageReceivedEvent = {
   type: "message_received",
@@ -48,5 +52,23 @@ describe("message_received", () => {
   test("listener and event keys agree", () => {
     expect(messageReceivedStep.correlationKey(input)).toBe("dm:acc_1:c_1");
     expect(messageReceivedStep.eventKeys(event)).toEqual(["dm:acc_1:c_1"]);
+  });
+
+  test("timeoutSeconds is optional and capped at 24h", () => {
+    expect(messageReceivedStep.timeoutSeconds?.(input)).toBeUndefined();
+    expect(
+      messageReceivedStep.timeoutSeconds?.({ ...input, timeoutSeconds: 60 }),
+    ).toBe(60);
+    expect(
+      messageReceivedInput.safeParse({
+        ...input,
+        timeoutSeconds: MAX_WAIT_SECONDS,
+      }).success,
+    ).toBe(true);
+    for (const timeoutSeconds of [0, 1.5, MAX_WAIT_SECONDS + 1])
+      expect(
+        messageReceivedInput.safeParse({ ...input, timeoutSeconds }).success,
+      ).toBe(false);
+    expect(messageReceivedStep.outcomes).toContain("timeout");
   });
 });

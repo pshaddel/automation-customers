@@ -2,11 +2,16 @@ import { z } from "zod";
 import type { MessageReceivedEvent } from "../../../social-media/social-media.events";
 import type { TriggerStep } from "../step.types";
 
+/** Instagram's messaging window: a later reply couldn't be answered with a normal DM. */
+export const MAX_WAIT_SECONDS = 24 * 60 * 60;
+
 export const messageReceivedInput = z.object({
   accountId: z.string().min(1),
   contactId: z.string().min(1),
   /** `email`: only a message containing an email address matches. */
   match: z.enum(["any", "email"]),
+  /** Stop waiting after this long and follow `next.timeout`. Omitted = wait indefinitely. */
+  timeoutSeconds: z.number().int().min(1).max(MAX_WAIT_SECONDS).optional(),
 });
 
 export type MessageReceivedInput = z.infer<typeof messageReceivedInput>;
@@ -30,10 +35,11 @@ export const messageReceivedStep: TriggerStep<
   eventType: "message_received",
   position: "wait",
   inputSchema: messageReceivedInput,
-  outcomes: ["ok"],
+  outcomes: ["ok", "timeout"],
   correlationKey: (input) => `dm:${input.accountId}:${input.contactId}`,
   eventKeys: (event) => [`dm:${event.accountId}:${event.contactId}`],
   subjectKey: (event) => `contact:${event.accountId}:${event.contactId}`,
+  timeoutSeconds: (input) => input.timeoutSeconds,
   match(event, input) {
     if (event.accountId !== input.accountId) return null;
     if (event.contactId !== input.contactId) return null;

@@ -54,6 +54,36 @@ describe("validateSteps", () => {
     );
   });
 
+  test("next.timeout needs config.timeoutSeconds", () => {
+    const steps = valid().map((s) =>
+      s.key === "wait_email"
+        ? {
+            ...s,
+            config: { ...s.config, timeoutSeconds: undefined },
+          }
+        : s,
+    );
+    expect(problemsOf(steps)).toEqual([
+      "wait_email: next.timeout is never followed without config.timeoutSeconds",
+    ]);
+  });
+
+  test("timeoutSeconds is capped at 24h", () => {
+    const steps = edit(valid(), "wait_email", {
+      config: {
+        accountId: "a",
+        contactId: "c",
+        match: "email",
+        timeoutSeconds: 24 * 60 * 60 + 1,
+      },
+    });
+    expect(
+      problemsOf(steps).some((p) =>
+        p.startsWith("wait_email: config.timeoutSeconds"),
+      ),
+    ).toBe(true);
+  });
+
   test("unknown outcome and dangling target", () => {
     const problems = problemsOf(
       edit(valid(), "reply", { next: { ok: "ask", maybe: "ghost" } }),
@@ -78,6 +108,7 @@ describe("validateSteps", () => {
     expect(problemsOf(edit(valid(), "ask", { next: {} }))).toEqual([
       "wait_email: Not reachable from the entry trigger",
       "send_link: Not reachable from the entry trigger",
+      "remind: Not reachable from the entry trigger",
     ]);
   });
 

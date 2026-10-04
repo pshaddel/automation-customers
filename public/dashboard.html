@@ -363,9 +363,11 @@
       { key: "ask", stepType: "send_dm", label: "Ask for their email",
         config: { ...contact, text: "Hey! What's your email address?" }, next: { ok: "wait_email" } },
       { key: "wait_email", stepType: "message_received", label: "Wait for an email address",
-        config: { ...contact, match: "email" }, next: { ok: "send_link" } },
+        config: { ...contact, match: "email", timeoutSeconds: 23 * 60 * 60 }, next: { ok: "send_link", timeout: "remind" } },
       { key: "send_link", stepType: "send_dm", label: "Send the pricing link",
         config: { ...contact, text: "Thanks {{steps.wait_email.email}}! Here's our pricing: https://example.com/pricing" }, next: {} },
+      { key: "remind", stepType: "send_dm", label: "Remind them once",
+        config: { ...contact, text: "Still interested? Comment 'pricing' again any time and we'll send the link." }, next: {} },
     ];
   }
 
@@ -487,7 +489,7 @@
         h("summary", {},
           badge(run.status),
           h("span", { class: "mono" }, run.subjectKey),
-          h("span", { class: "muted" }, `${ago(run.startedAt)} · ${run.stepCount} steps${run.currentStepKey ? ` · at ${run.currentStepKey}` : ""}`),
+          h("span", { class: "muted" }, `${ago(run.startedAt)} · ${run.stepCount} steps${run.currentStepKey ? ` · at ${run.currentStepKey}` : ""}${run.waitExpiresAt ? ` · times out ${new Date(run.waitExpiresAt).toLocaleString()}` : ""}`),
           run.error ? h("span", { class: "error" }, run.error) : null,
           run.status === "waiting"
             ? h("button", { type: "button", class: "secondary", onclick: (e) => { e.preventDefault(); e.stopPropagation(); sendSampleReply(run.id); } }, "Send sample reply")

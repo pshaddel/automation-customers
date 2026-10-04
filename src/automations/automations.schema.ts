@@ -126,6 +126,7 @@ export const runSummarySchema = t.Object({
   currentStepKey: t.Nullable(t.String()),
   stepCount: t.Number(),
   error: t.Nullable(t.String()),
+  waitExpiresAt: t.Nullable(t.String({ format: "date-time" })),
   startedAt: t.String({ format: "date-time" }),
   finishedAt: t.Nullable(t.String({ format: "date-time" })),
 });

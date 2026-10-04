@@ -9,6 +9,7 @@ import { closeRedis } from "../../lib/redis";
 import { webhooksModule } from "../../social-media/webhooks.route";
 import { startAutomationEventsWorker } from "../automation-events.worker";
 import { startAutomationStepsWorker } from "../automation-steps.worker";
+import { startAutomationWaitTimeoutsWorker } from "../automation-wait-timeouts.worker";
 import { automationsModule } from "../automations.route";
 import { pricingExampleSteps } from "../pricing-example";
 import {
@@ -25,6 +26,7 @@ const ready =
 
 const eventsQueue = `automation-events-test-${crypto.randomUUID()}`;
 const stepsQueue = `automation-steps-test-${crypto.randomUUID()}`;
+const timeoutsQueue = `automation-wait-timeouts-test-${crypto.randomUUID()}`;
 const social = fakeSocialMedia();
 const app = new Elysia()
   .use(errorHandling)
@@ -76,7 +78,10 @@ async function until<T>(
 }
 
 describe.skipIf(!ready)("automation end to end (integration)", () => {
-  let workers: { close(): Promise<void> }[] = [];
+  let workers: {
+    close(): Promise<void>;
+    waitUntilReady(): Promise<unknown>;
+  }[] = [];
 
   beforeAll(async () => {
     const events = startAutomationEventsWorker({
@@ -85,15 +90,20 @@ describe.skipIf(!ready)("automation end to end (integration)", () => {
     });
     const steps = startAutomationStepsWorker({
       queueName: stepsQueue,
+      waitTimeoutsQueueName: timeoutsQueue,
       socialMedia: social.client,
     });
-    workers = [events, steps];
-    await Promise.all([events.waitUntilReady(), steps.waitUntilReady()]);
+    const timeouts = startAutomationWaitTimeoutsWorker({
+      queueName: timeoutsQueue,
+      stepsQueueName: stepsQueue,
+    });
+    workers = [events, steps, timeouts];
+    await Promise.all(workers.map((w) => w.waitUntilReady()));
   });
 
   afterAll(async () => {
     await Promise.all(workers.map((w) => w.close()));
-    for (const name of [eventsQueue, stepsQueue])
+    for (const name of [eventsQueue, stepsQueue, timeoutsQueue])
       await createQueue(name).obliterate({ force: true });
     await closeQueues();
     await closeRedis();
@@ -217,5 +227,91 @@ describe.skipIf(!ready)("automation end to end (integration)", () => {
 
     const list = await call("GET", "/api/automations", undefined, cookie);
     expect(list.body[0].runs.completed).toBe(1);
+  }, 20_000);
+
+  test("no reply: the delayed timeout job sends the reminder and completes the run", async () => {
+    const signIn = await call("POST", "/api/auth/sign-in", {
+      username,
+      password: "correct-horse-battery",
+    });
+    const cookie = signIn.res.headers.getSetCookie()[0]?.split(";")[0] ?? "";
+    const accountId = uniqueId("acc");
+    const sentBefore = social.sendDm.mock.calls.length;
+
+    const { body: automation } = await call(
+      "POST",
+      "/api/automations",
+      { name: "Pricing, 1s wait" },
+      cookie,
+    );
+    for (const step of pricingExampleSteps(accountId))
+      await call(
+        "POST",
+        `/api/automations/${automation.id}/steps`,
+        step.key === "wait_email"
+          ? { ...step, config: { ...step.config, timeoutSeconds: 1 } }
+          : step,
+        cookie,
+      );
+    await call(
+      "POST",
+      `/api/automations/${automation.id}/publish`,
+      undefined,
+      cookie,
+    );
+    await call(
+      "PATCH",
+      `/api/automations/${automation.id}`,
+      { active: true },
+      cookie,
+    );
+
+    await call("POST", "/api/social-media/webhooks/comments", {
+      object: "instagram",
+      entry: [
+        {
+          id: accountId,
+          time: Date.now(),
+          changes: [
+            {
+              field: "comments",
+              value: {
+                id: uniqueId("cm"),
+                text: "pricing please",
+                from: { id: "c_1" },
+                media: { id: "p_1" },
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const runs = () =>
+      call(
+        "GET",
+        `/api/automations/${automation.id}/runs`,
+        undefined,
+        cookie,
+      ).then((r) => r.body);
+    const [waiting] = await until(runs, (r) => r[0]?.status === "waiting");
+    expect(waiting.waitExpiresAt).not.toBeNull();
+
+    const [done] = await until(runs, (r) => r[0]?.status === "completed");
+    expect(done.waitExpiresAt).toBeNull();
+    const detail = await call(
+      "GET",
+      `/api/automations/${automation.id}/runs/${done.id}`,
+      undefined,
+      cookie,
+    );
+    expect(detail.body.steps.map((s: Json) => [s.stepKey, s.outcome])).toEqual([
+      ["trigger", "ok"],
+      ["reply", "ok"],
+      ["ask", "ok"],
+      ["wait_email", "timeout"],
+      ["remind", "ok"],
+    ]);
+    expect(social.sendDm.mock.calls.length - sentBefore).toBe(2);
   }, 20_000);
 });

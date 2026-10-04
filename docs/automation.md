@@ -66,7 +66,7 @@ The `step_type` values below are **permanent**: they are stored in `automation_s
 | `comment_received` | trigger | `accountId`, `matchMode` (`any` \| `contains` \| `exact`), `keyword?`, `postId?` (null = any post) | `accountId`, `postId`, `commentId`, `contactId`, `text` | `ok` | — |
 | `reply_to_comment` | action | `accountId`, `commentId`, `text` | `replyId` | `ok` | `commentOnPost()` |
 | `send_dm` | action | `accountId`, `contactId`, `text` | `messageId` | `ok` | `sendDm()` |
-| `message_received` | trigger | `accountId`, `contactId`, `match` (`any` \| `email`) | `messageId`, `text`, `email` (null when `match: any` finds none) | `ok` | — |
+| `message_received` | trigger | `accountId`, `contactId`, `match` (`any` \| `email`), `timeoutSeconds?` (1–86400; omitted = wait indefinitely) | `messageId`, `text`, `email` (null when `match: any` finds none); on timeout `{ timedOut: true }` | `ok`, `timeout` | — |
 
 How the two triggers listen:
 
@@ -158,6 +158,7 @@ To edit a published automation, copy its steps into a new draft version, edit it
 | `run_id` | Null = entry listener. Unique when set: a run waits on at most one trigger. |
 | `event_type` | From the trigger's implementation. |
 | `correlation_key` | An opaque string from the trigger's `correlationKey(input)`. |
+| `expires_at` | Wait listeners only: when the wait times out (`timeoutSeconds`). Null = never; always null for entry listeners. Expired listeners are ignored by matching. |
 
 Index `(event_type, correlation_key)`. The engine only compares strings. Content filters (keyword, email) are checked in code by the trigger's `match()`, after the indexed lookup narrows the candidates.
 
@@ -222,6 +223,7 @@ Two queues, both using `DEFAULT_JOB_OPTIONS` (3 attempts, exponential backoff fr
 |---|---|---|---|
 | `automation-events` | Incoming event | Normalized event | `<eventType>-<eventId>` |
 | `automation-steps` | Step of a run | `{ runId, stepId, sequence }` | `<runId>-<sequence>` |
+| `automation-wait-timeouts` | Wait whose trigger has `timeoutSeconds`; **delayed** until the listener's `expires_at` | `{ runId, stepId, sequence }` | `timeout-<runId>-<sequence>` |
 
 ### Event job: matching an event to listeners
 
@@ -247,13 +249,37 @@ Two queues, both using `DEFAULT_JOB_OPTIONS` (3 attempts, exponential backoff fr
 3. Look up the implementation in the registry. An unknown `step_type` raises `UnrecoverableError`.
 4. Resolve the config's templates against `run.context` and validate it with `inputSchema`. A missing template value or invalid input raises `UnrecoverableError`. Record the step run as `running`, with this attempt number and the input.
 5. Branch on the step's kind:
-   - **Trigger step (mid-flow):** in one transaction, mark the step run `waiting`, insert the wait listener with `correlationKey(input)`, and set the run to `waiting`. Done; the event job resumes it later.
+   - **Trigger step (mid-flow):** in one transaction, mark the step run `waiting`, insert the wait listener with `correlationKey(input)`, and set the run to `waiting`. After the commit, if the input has `timeoutSeconds`, enqueue the delayed timeout job (see [Wait timeouts](#wait-timeouts)). Done; the event job resumes it later, or the timeout job ends the wait.
    - **Action step:** call `execute(input, ctx)`. Then, in one transaction:
      - mark the step run `succeeded`, storing the output and outcome
      - store the output in `context.steps[<key>]`
      - increment `step_count`, failing the run if it goes over the cap (e.g. 50)
      - set `current_step_id = next[outcome]`, or mark the run `completed` if there's no next step
 6. After the commit, enqueue `next[outcome]` with `sequence + 1`, if there is one.
+
+### Wait timeouts
+
+A wait can be bounded by setting `timeoutSeconds` in the trigger step's config (`message_received` only for now; a trigger type opts in through `TriggerStep.timeoutSeconds(input)`). It's opt-in: without it the run waits indefinitely, as before, so existing versions keep their behaviour and no new step type is needed (the field and the outcome are additive).
+
+The deadline is stored twice, with different jobs: `automation_triggers.expires_at` is the **source of truth**, and the delayed BullMQ job is only the **wake-up call** that moves the run on.
+
+- **Limit:** `inputSchema` caps it at 86400 (24h), Instagram's messaging window. A reply after 24h couldn't be answered with a normal DM anyway. The value must be a literal number (templates are only allowed in string fields).
+- **Scheduling:** `waitOnTrigger` inserts the wait listener with `expires_at = now() + timeoutSeconds` and returns it. After the commit, the runner adds a job to `automation-wait-timeouts`, delayed until `expires_at`, with `jobId = timeout-<runId>-<sequence>`. A crash between the commit and the enqueue is covered: the step job's retry sees its step run `waiting`, reads `expires_at` back and re-adds the timeout job (the job id makes that a no-op if it already exists).
+- **Matching respects the deadline:** `findListeners` skips wait listeners whose `expires_at` has passed. A reply that arrives after the deadline doesn't resume the run, even if the timeout job is late (worker backlog or downtime); it ends unmatched like any other event.
+- **When the job fires** (`expireWait()`), in one transaction:
+  1. claim the listener: `DELETE FROM automation_triggers ... WHERE run_id = $1 AND step_id = $2 AND expires_at <= now()`, joined to the step run at `sequence` with status `waiting`, `RETURNING id`. This is the first statement, as in `resumeRun`, so the two take their locks in the same order and can't deadlock. The join stops an old timeout job from expiring a later wait on the same step (a loop): that wait has a different sequence.
+     - no row, and the listener exists but hasn't expired → the job fired early (Redis and Postgres clocks disagree): throw `WaitNotExpiredYetError`, and BullMQ retries in 1s, then 2s
+     - no row otherwise → a reply or a cancellation won: do nothing
+  2. lock the run; if it isn't `waiting`, do nothing
+  3. mark the step run `succeeded` with outcome `timeout` and output `{ timedOut: true }`
+  4. `advance()` with `next.timeout`: the run continues there (e.g. a "still interested?" DM), or, with no `next.timeout`, it's `completed`, the same as any outcome with no next step. No new run status is needed; the step run's `timeout` outcome shows why it ended.
+
+  Then enqueue the next step, if any. A retry that finds nothing to claim but sees the step run's outcome is `timeout` and the run still `running` re-enqueues the run's current step (sequence `step_count + 1`), covering a crash between the commit and the enqueue.
+- **Reply wins first:** `resumeRun` consumes the listener, and the timeout job later finds nothing to claim and no-ops. Leaving the delayed job in place is simpler than removing it, and harmless. Cancelling a run (pausing or deleting the automation) works the same way.
+- **Validation:** `inputSchema` enforces the cap. Publish also rejects a `next.timeout` on a step without `timeoutSeconds`, since that branch could never be taken.
+- **Visibility:** the runs API returns `waitExpiresAt` for a waiting run, and the dashboard shows "times out ..." on it.
+- **Not built:** a periodic sweep for expired listeners whose delayed job was lost (e.g. Redis restarted without persistence). `expires_at` makes it a simple query; it belongs with the stuck-run sweep of edge cases #17 and #22.
+- **Code:** `automation-wait-timeouts.{queue,worker}.ts` in `src/automations/`, registered in `src/workers.ts`; `waitOnTrigger()`, `waitExpiry()` and `expireWait()` in `runs.service.ts`; migration `004_wait_timeouts.sql`.
 
 ### Failure handling
 
@@ -279,9 +305,11 @@ reply       reply_to_comment   { accountId: "{{trigger.accountId}}", commentId: 
 ask         send_dm            { accountId: "{{trigger.accountId}}", contactId: "{{trigger.contactId}}",
                                  text: "What's your email?" }                                      { ok: wait_email }
 wait_email  message_received   { accountId: "{{trigger.accountId}}", contactId: "{{trigger.contactId}}",
-                                 match: "email" }                                                  { ok: send_link }
+                                 match: "email", timeoutSeconds: 82800 }                           { ok: send_link, timeout: remind }
 send_link   send_dm            { accountId: "{{trigger.accountId}}", contactId: "{{trigger.contactId}}",
                                  text: "Here's your link: ..." }                                   {}
+remind      send_dm            { accountId: "{{trigger.accountId}}", contactId: "{{trigger.contactId}}",
+                                 text: "Still interested? ..." }                                   {}
 ```
 
 Walkthrough:
@@ -291,6 +319,7 @@ Walkthrough:
 3. `wait_email` registers a wait listener on `dm:acc_1:<contactId>`, and the run goes to `waiting`.
 4. `POST .../webhooks/messages` with "hi" → `match: email` rejects it → no match → retried twice → unmatched. The run keeps waiting.
 5. `POST .../webhooks/messages` with "me@x.com" → the wait listener matches → the run resumes → `send_link` runs → the run is `completed`.
+6. No email within 23h instead: the delayed timeout job ends the wait with outcome `timeout` → `remind` runs → the run is `completed`.
 
 A version that wants to answer "that doesn't look like an email" can use `match: "any"`, followed by a `condition` step type (not needed for v1) whose `no_match` points back to an `ask_again` step.
 
@@ -331,8 +360,10 @@ A version that wants to answer "that doesn't look like an email" can use `match:
 | 15 | Automation paused or deleted | Entry listeners deleted; waiting runs cancelled and their listeners deleted | Handled |
 | 16 | New version published while runs are in progress | Entry listeners move to the new version; existing runs and wait listeners keep their pinned version | Handled |
 | 17 | Failure handler itself fails (e.g. DB down on the last attempt) | The run stays `running` with no job | Limitation; later a sweep for runs `running` with no recent step activity |
-| 18 | Contact never replies | The run waits indefinitely. Later: `expires_at` on listeners + one delayed job per wait | Limitation |
-| 19 | Platform messaging rules (e.g. Instagram allows one private reply to a comment and a limited window after the contact's last message) | Not enforced; long waits may make the final DM undeliverable | Limitation; verify against platform docs |
+| 18 | Contact never replies | Without `timeoutSeconds` the run waits indefinitely. With it, the listener gets `expires_at`, and a delayed job claims it and follows `next.timeout`, or completes the run ([Wait timeouts](#wait-timeouts)) | Handled when `timeoutSeconds` is set; a lost delayed job needs the sweep from #17 |
+| 23 | Reply arrives after the deadline but before the timeout job runs | `findListeners` ignores expired listeners, so the reply doesn't match | Handled |
+| 24 | Reply and timeout at the same moment | Both claim the listener with `DELETE ... RETURNING` first; only one gets the row | Handled |
+| 19 | Platform messaging rules (e.g. Instagram allows one private reply to a comment and a limited window after the contact's last message) | Not enforced. `timeoutSeconds` is capped at 24h so a wait can't outlive Instagram's messaging window, but nothing forces an author to set it | Partly handled; verify against platform docs |
 | 20 | Unsigned webhook requests | The dummy endpoints accept any caller | Limitation; real endpoints verify `X-Hub-Signature-256` |
 | 21 | The commenter's `from.id` (comment webhook) differs from the DM `sender.id` for the same person | The wait listener would never match | Verify against platform docs; if they differ, map both ids to one contact |
 | 22 | Crash after an event job resumes a run, before it enqueues the next step | The listener is already consumed, so the retry finds no match; the run stays `running` with no job | Limitation; covered by the same sweep as #17 |
@@ -426,6 +457,7 @@ Test conventions follow the existing suites: integration tests hit the docker Po
 - **Constraints added:** at most one draft per automation, and at most one entry listener per automation (partial unique indexes).
 - **Shared helpers:** `isUniqueViolation` moved to `src/db/db.ts` for reuse. `ValidationError` (`400`, with `details`) was added to `src/lib/errors.ts`.
 - **Dashboard example:** the dashboard carries its own copy of the "pricing" example (`load the brief's example`), because the static UI has no build step to import `pricing-example.ts`.
+- **Wait timeouts** (added after v1): `timeoutSeconds` on `message_received`, `automation_triggers.expires_at` (migration `004`), the `automation-wait-timeouts` queue and worker. The "pricing" example now waits 23h and then sends one reminder (`remind`). See [Wait timeouts](#wait-timeouts).
 - **Tests:** unit tests per step type, templates, validation and webhook normalization. Integration tests for the API (`automations.route.test.ts`), both processors driven with fake jobs (`execution.test.ts`), and the full HTTP → BullMQ → workers flow on isolated queues (`e2e.test.ts`).
 
 ### Open questions

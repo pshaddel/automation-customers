@@ -32,6 +32,7 @@ src/
   <domain>/           <domain>.route.ts · .service.ts · .queue.ts · .worker.ts · .seed.ts · .schema.ts · __tests__/
     auth/  users/  health/  example/
     automations/      engine + API: automation-events.{queue,worker}, automation-steps.{queue,worker} (step runner),
+                      automation-wait-timeouts.{queue,worker} (delayed job per wait with timeoutSeconds),
                       automations.{route,service,schema,seed}, runs.service, validation, template,
                       steps/<step_type>/ (one folder per step implementation) + steps/registry.ts
     social-media/     simulated Instagram webhooks (webhooks.{route,service,schema}) and the dummy client (sendDm, commentOnPost)
@@ -46,7 +47,7 @@ Conventions:
 - **Logging:** structured, `logger.info({ event: "snake_case_event", source: "<component>", ...ids })`.
 - **Auth:** add `{ auth: true }` to a route to require a session. The handler then receives a typed `user` (`src/auth/auth.plugin.ts`).
 - **Migrations:** new `src/migrations/NNN_*.sql` file, never edit an applied one. Each file runs in one transaction, so no `CREATE INDEX CONCURRENTLY`. Tables get `created_at`/`updated_at` (with the `set_updated_at()` trigger from `001_init.sql`) and soft-delete via `deleted_at`.
-- **Seeds:** `src/<domain>/<domain>.seed.ts` exporting `order: number` and `run(db)`. Seeds must be idempotent: running them again leaves the same end state. Skipping existing rows (users) or deleting and re-creating demo data (`automations.seed.ts` re-creates alice's demo automation and its runs) are both fine.
+- **Seeds:** `src/<domain>/<domain>.seed.ts` exporting `order: number` and `run(db)`. Seeds must be idempotent: running them again leaves the same end state. Skipping existing rows (users) or deleting and re-creating demo data are both fine. `automations.seed.ts` hard-deletes alice's demo automation (its runs and listeners cascade) and re-creates it from `pricing-example.ts`. `public/dashboard.html` has its own copy of that example, so keep the two in sync.
 
 ## Async tasks (BullMQ)
 
@@ -91,11 +92,12 @@ Step types:
 
 Engine invariants (`runs.service.ts`, the two workers):
 - Every run state transition locks the run row (`SELECT ... FOR UPDATE`) inside `getDb().begin()`, so a resume, a step completion and a cancellation can't interleave.
-- A run's next step sequence is always `step_count + 1`. Step job ids are `<runId>-<sequence>`, event job ids `<eventType>-<eventId>`.
+- A run's next step sequence is always `step_count + 1`. Step job ids are `<runId>-<sequence>`, event job ids `<eventType>-<eventId>`, wait-timeout job ids `timeout-<runId>-<sequence>`.
 - `automation_triggers` holds listeners: `run_id IS NULL` = entry listener (one per active automation, on its current version, kept in sync by `syncEntryListener`); `run_id` set = wait listener, claimed with `DELETE ... RETURNING` when matched.
 - `next` maps outcome → step **key** (keys are stable across versions). Published versions are immutable; edits go to the draft (copy-on-write).
 - Wait listeners match against the waiting step run's resolved `input`; entry trigger config can't contain templates.
-- Tests: processors are driven with `fakeJob()` / `fakeSocialMedia()` from `src/automations/__tests__/helpers.ts`; `e2e.test.ts` runs HTTP → BullMQ → workers on queue names unique to the file.
+- **Wait timeouts:** a wait trigger opts in with `TriggerStep.timeoutSeconds(input)` (`message_received`: config `timeoutSeconds`, max 24h) and lists `timeout` in its outcomes. `automation_triggers.expires_at` is the source of truth (`findListeners` ignores expired listeners); the delayed job on `automation-wait-timeouts` only wakes the run up. `expireWait()` claims the listener with `DELETE ... RETURNING` before locking the run, the same order as `resumeRun`, then follows `next.timeout` or completes the run. Keep that lock order in any new code that claims listeners.
+- Tests: processors (including `processWaitTimeoutJob`; simulate an elapsed timeout by moving `expires_at` into the past) are driven with `fakeJob()` / `fakeSocialMedia()` from `src/automations/__tests__/helpers.ts`; `e2e.test.ts` runs HTTP → BullMQ → workers on queue names unique to the file.
 
 ## Environment notes
 

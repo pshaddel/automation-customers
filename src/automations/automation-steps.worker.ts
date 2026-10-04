@@ -1,4 +1,5 @@
 import { type Job, UnrecoverableError, Worker } from "bullmq";
+import { getDb } from "../db/db";
 import { logger } from "../lib/logger";
 import { getRedisConnection } from "../lib/redis";
 import {
@@ -12,6 +13,11 @@ import {
   type StepJobData,
 } from "./automation-steps.queue";
 import {
+  AUTOMATION_WAIT_TIMEOUTS_QUEUE,
+  createWaitTimeoutEnqueuer,
+  type EnqueueWaitTimeout,
+} from "./automation-wait-timeouts.queue";
+import {
   completeStep,
   failStepRun,
   getRun,
@@ -19,6 +25,7 @@ import {
   getStepRun,
   handleStepFailure,
   startStepRun,
+  waitExpiry,
   waitOnTrigger,
 } from "./runs.service";
 import { getStepType } from "./steps/registry";
@@ -27,6 +34,7 @@ import { resolveTemplates } from "./template";
 export interface StepWorkerDeps {
   socialMedia: SocialMediaClient;
   enqueueStep: EnqueueStep;
+  enqueueWaitTimeout: EnqueueWaitTimeout;
 }
 
 export type StepJobResult =
@@ -61,6 +69,14 @@ export async function processStepJob(
     getStepRun(runId, sequence),
   ]);
   if (!run || !step) return skip("run or step no longer exists");
+  // A previous attempt started waiting but may have crashed before scheduling the
+  // timeout; the timeout job id makes scheduling it again a no-op.
+  if (existing?.status === "waiting") {
+    const expiresAt = await waitExpiry(getDb(), runId, stepId);
+    if (expiresAt)
+      await deps.enqueueWaitTimeout({ runId, stepId, sequence }, expiresAt);
+    return skip("step is already waiting");
+  }
   if (run.status !== "running") return skip(`run is ${run.status}`);
 
   // A previous attempt committed but crashed before enqueueing the next step.
@@ -74,7 +90,6 @@ export async function processStepJob(
       });
     return skip("step already succeeded");
   }
-  if (existing?.status === "waiting") return skip("step is already waiting");
   if (!existing && run.currentStepId !== stepId)
     return skip("stale job: run has moved on");
 
@@ -94,14 +109,17 @@ export async function processStepJob(
     await startStepRun({ runId, stepId, sequence, attempt, input });
 
     if (type.kind === "trigger") {
-      await waitOnTrigger({
+      const expiresAt = await waitOnTrigger({
         runId,
         step,
         sequence,
         eventType: type.eventType,
         correlationKey: type.correlationKey(input),
+        timeoutSeconds: type.timeoutSeconds?.(input),
       });
-      logger.info({ event: "automation_run_waiting", ...log });
+      if (expiresAt)
+        await deps.enqueueWaitTimeout({ runId, stepId, sequence }, expiresAt);
+      logger.info({ event: "automation_run_waiting", ...log, expiresAt });
       return { status: "waiting" };
     }
 
@@ -168,17 +186,20 @@ export async function processStepJob(
   }
 }
 
-/** `queueName` is overridable so tests run against an isolated queue. */
+/** Queue names are overridable so tests run against isolated queues. */
 export function startAutomationStepsWorker({
   queueName = AUTOMATION_STEPS_QUEUE,
+  waitTimeoutsQueueName = AUTOMATION_WAIT_TIMEOUTS_QUEUE,
   socialMedia = getSocialMediaClient(),
 }: {
   queueName?: string;
+  waitTimeoutsQueueName?: string;
   socialMedia?: SocialMediaClient;
 } = {}) {
   const deps: StepWorkerDeps = {
     socialMedia,
     enqueueStep: createStepEnqueuer(queueName),
+    enqueueWaitTimeout: createWaitTimeoutEnqueuer(waitTimeoutsQueueName),
   };
   const worker = new Worker<StepJobData, StepJobResult>(
     queueName,

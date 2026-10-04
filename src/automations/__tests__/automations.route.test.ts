@@ -245,7 +245,7 @@ describe.skipIf(!dbReady)("automations API (integration)", () => {
       hasDraft: false,
       draft: null,
     });
-    expect(published.body.published.steps).toHaveLength(5);
+    expect(published.body.published.steps).toHaveLength(6);
     expect(
       (await call("POST", `/api/automations/${id}/publish`, { cookie })).status,
     ).toBe(400); // nothing to publish
@@ -271,7 +271,7 @@ describe.skipIf(!dbReady)("automations API (integration)", () => {
     expect(edited.status).toBe(200);
     const detail = await call("GET", `/api/automations/${id}`, { cookie });
     expect(detail.body.draft.version).toBe(2);
-    expect(detail.body.draft.steps).toHaveLength(5);
+    expect(detail.body.draft.steps).toHaveLength(6);
     const replyIn = (v: Json) =>
       v.steps.find((s: Json) => s.key === "reply").config.text;
     expect(replyIn(detail.body.draft)).toBe("Check your DMs");

@@ -55,6 +55,16 @@ export function validateSteps(steps: StepDefinition[]): GraphValidation {
           stepKey: step.key,
           problem: `config${issue.path.length ? `.${issue.path.join(".")}` : ""}: ${issue.message}`,
         });
+    if (
+      parsed.success &&
+      step.next.timeout &&
+      type.kind === "trigger" &&
+      type.timeoutSeconds?.(parsed.data) === undefined
+    )
+      problems.push({
+        stepKey: step.key,
+        problem: "next.timeout is never followed without config.timeoutSeconds",
+      });
 
     for (const [outcome, target] of Object.entries(step.next)) {
       if (outcome !== "error" && !type.outcomes.includes(outcome))

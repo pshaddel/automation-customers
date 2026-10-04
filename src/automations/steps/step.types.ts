@@ -61,6 +61,11 @@ export interface TriggerStep<
   match(event: Event, input: Input): Output | null;
   /** Who a run started by this event is about; used to dedupe active runs. */
   subjectKey(event: Event): string;
+  /**
+   * Wait triggers only: how long a run may wait, or undefined to wait indefinitely.
+   * When it elapses the step finishes with outcome `timeout` (list it in `outcomes`).
+   */
+  timeoutSeconds?(input: Input): number | undefined;
 }
 
 export type AnyStep = ActionStep | TriggerStep;

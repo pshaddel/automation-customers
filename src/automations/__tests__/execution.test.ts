@@ -7,13 +7,18 @@ import type {
 import { NoMatchYetError, processEventJob } from "../automation-events.worker";
 import type { StepJobData } from "../automation-steps.queue";
 import { processStepJob } from "../automation-steps.worker";
+import type { WaitTimeoutJobData } from "../automation-wait-timeouts.queue";
+import {
+  processWaitTimeoutJob,
+  WaitNotExpiredYetError,
+} from "../automation-wait-timeouts.worker";
 import {
   addStep,
   createAutomation,
   publishAutomation,
   updateAutomation,
 } from "../automations.service";
-import { pricingExampleSteps } from "../pricing-example";
+import { PRICING_WAIT_SECONDS, pricingExampleSteps } from "../pricing-example";
 import type { StepDefinition } from "../validation";
 import {
   createTestUser,
@@ -49,7 +54,13 @@ async function setup(
   const enqueueStep = mock(async (data: StepJobData) => {
     enqueued.push(data);
   });
-  const deps = { socialMedia: social.client, enqueueStep };
+  const timeouts: { data: WaitTimeoutJobData; expiresAt: Date }[] = [];
+  const enqueueWaitTimeout = mock(
+    async (data: WaitTimeoutJobData, expiresAt: Date) => {
+      timeouts.push({ data, expiresAt });
+    },
+  );
+  const deps = { socialMedia: social.client, enqueueStep, enqueueWaitTimeout };
 
   const comment = (
     contactId = "c_1",
@@ -99,6 +110,29 @@ async function setup(
     `;
   const waitListeners = (runId: string) =>
     getDb()`SELECT correlation_key FROM automation_triggers WHERE run_id = ${runId}`;
+  /** Moves the run's wait deadline, e.g. into the past to simulate an elapsed timeout. */
+  const setWaitExpiry = (runId: string, seconds: number) =>
+    getDb()`
+      UPDATE automation_triggers SET expires_at = now() + ${seconds}::int * interval '1 second'
+      WHERE run_id = ${runId}
+    `;
+  /** Runs the most recently scheduled timeout job, as if its delay had elapsed. */
+  const runTimeout = (attemptsMade = 0) => {
+    const scheduled = timeouts.at(-1);
+    if (!scheduled) throw new Error("no timeout scheduled");
+    return processWaitTimeoutJob(fakeJob(scheduled.data, attemptsMade), {
+      enqueueStep,
+    });
+  };
+  /** Starts a run from a comment and drives it until it waits for the email. */
+  const startWaiting = async () => {
+    const started = await processEventJob(fakeJob(comment()), deps);
+    const runId = started.matched === "entry" ? (started.runIds[0] ?? "") : "";
+    await runNextStep(); // reply
+    await runNextStep(); // ask
+    expect(await runNextStep()).toEqual({ status: "waiting" }); // wait_email
+    return runId;
+  };
 
   return {
     userId,
@@ -113,6 +147,10 @@ async function setup(
     runRow,
     stepRuns,
     waitListeners,
+    timeouts,
+    setWaitExpiry,
+    runTimeout,
+    startWaiting,
   };
 }
 
@@ -134,6 +172,10 @@ describe.skipIf(!dbReady)("execution (integration)", () => {
     expect(await t.waitListeners(runId)).toEqual([
       { correlation_key: `dm:${t.accountId}:c_1` },
     ]);
+    expect(t.timeouts).toHaveLength(1);
+    expect(t.timeouts[0]?.data).toMatchObject({ runId, sequence: 4 });
+    const waitMs = (t.timeouts[0]?.expiresAt.getTime() ?? 0) - Date.now();
+    expect(Math.abs(waitMs - PRICING_WAIT_SECONDS * 1000)).toBeLessThan(60_000);
 
     // Not an email: retried while attempts remain, then unmatched; the run keeps waiting.
     await expect(
@@ -307,5 +349,114 @@ describe.skipIf(!dbReady)("execution (integration)", () => {
         matched: "none",
       },
     );
+  });
+
+  test("a wait that times out follows next.timeout", async () => {
+    const t = await setup();
+    const runId = await t.startWaiting();
+
+    await t.setWaitExpiry(runId, -1);
+    // Expired: a late reply no longer matches, even before the timeout job runs.
+    expect(
+      await processEventJob(fakeJob(t.message("me@example.com"), 2), t.deps),
+    ).toEqual({ matched: "none" });
+
+    const result = await t.runTimeout();
+    expect(result).toMatchObject({ status: "expired" });
+    expect(await t.waitListeners(runId)).toEqual([]);
+    expect(t.enqueued.at(-1)).toMatchObject({ runId, sequence: 5 });
+    expect((await t.stepRuns(runId)).at(-1)).toMatchObject({
+      sequence: 4,
+      status: "succeeded",
+      outcome: "timeout",
+    });
+
+    expect(await t.runNextStep()).toEqual({
+      status: "completed",
+      nextStepId: null,
+    }); // remind
+    expect(t.social.sendDm).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(t.social.sendDm.mock.calls[1]?.[0])).toContain(
+      "Still interested?",
+    );
+    expect(await t.runRow(runId)).toMatchObject({
+      status: "completed",
+      step_count: 5,
+    });
+
+    // A retried timeout job (e.g. it crashed before enqueueing) re-enqueues the next step
+    // while the run is still on it, and does nothing once the run has finished.
+    const enqueuedBefore = t.enqueued.length;
+    expect(await t.runTimeout(1)).toMatchObject({ status: "skipped" });
+    expect(t.enqueued).toHaveLength(enqueuedBefore);
+  });
+
+  test("a retried timeout job re-enqueues the step after the wait", async () => {
+    const t = await setup();
+    const runId = await t.startWaiting();
+    await t.setWaitExpiry(runId, -1);
+    await t.runTimeout();
+    t.enqueued.pop(); // as if the first attempt crashed before enqueueing `remind`
+
+    expect(await t.runTimeout(1)).toMatchObject({ status: "skipped" });
+    expect(t.enqueued.at(-1)).toMatchObject({ runId, sequence: 5 });
+  });
+
+  test("without next.timeout, a timed-out wait completes the run", async () => {
+    const t = await setup((steps) =>
+      steps
+        .filter((s) => s.key !== "remind")
+        .map((s) =>
+          s.key === "wait_email" ? { ...s, next: { ok: "send_link" } } : s,
+        ),
+    );
+    const runId = await t.startWaiting();
+    await t.setWaitExpiry(runId, -1);
+
+    expect(await t.runTimeout()).toEqual({
+      status: "expired",
+      nextStepId: null,
+    });
+    expect(await t.runRow(runId)).toMatchObject({
+      status: "completed",
+      step_count: 4,
+    });
+    expect(t.social.sendDm).toHaveBeenCalledTimes(1);
+  });
+
+  test("a reply before the timeout makes the timeout job a no-op", async () => {
+    const t = await setup();
+    const runId = await t.startWaiting();
+    expect(
+      await processEventJob(fakeJob(t.message("me@example.com")), t.deps),
+    ).toEqual({ matched: "wait", runId });
+
+    expect(await t.runTimeout()).toMatchObject({ status: "skipped" });
+    expect((await t.stepRuns(runId)).at(-1)).toMatchObject({
+      sequence: 4,
+      outcome: "ok",
+    });
+    expect(t.enqueued.at(-1)).toMatchObject({ runId, sequence: 5 });
+  });
+
+  test("a timeout job firing before the deadline retries", async () => {
+    const t = await setup();
+    const runId = await t.startWaiting();
+    await expect(t.runTimeout()).rejects.toBeInstanceOf(WaitNotExpiredYetError);
+    expect((await t.runRow(runId))?.status).toBe("waiting");
+  });
+
+  test("a retried wait step re-schedules its timeout", async () => {
+    const t = await setup();
+    const runId = await t.startWaiting();
+    const waitJob = t.enqueued.at(-1) as StepJobData;
+
+    expect(await processStepJob(fakeJob(waitJob, 1), t.deps)).toEqual({
+      status: "skipped",
+      reason: "step is already waiting",
+    });
+    expect(t.timeouts).toHaveLength(2);
+    expect(t.timeouts[1]).toEqual(t.timeouts[0] as (typeof t.timeouts)[0]);
+    expect((await t.runRow(runId))?.status).toBe("waiting");
   });
 });
