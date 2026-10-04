@@ -1,4 +1,5 @@
 import { type Job, Worker } from "bullmq";
+import { getDb } from "../db/db";
 import { logger } from "../lib/logger";
 import { getRedisConnection } from "../lib/redis";
 import type { SocialEvent } from "../social-media/social-media.events";
@@ -13,11 +14,13 @@ import {
 } from "./automation-steps.queue";
 import {
   findListeners,
+  holdUnmatchedEvent,
   type ListenerMatch,
+  lockConversations,
   resumeRun,
   startRun,
 } from "./runs.service";
-import { eventKeysFor, getStepType } from "./steps/registry";
+import { eventKeysFor, getStepType, isWaitEventType } from "./steps/registry";
 
 export interface EventWorkerDeps {
   enqueueStep: EnqueueStep;
@@ -26,15 +29,8 @@ export interface EventWorkerDeps {
 export type EventJobResult =
   | { matched: "wait"; runId: string }
   | { matched: "entry"; runIds: string[] }
+  | { matched: "held" }
   | { matched: "none" };
-
-/** Thrown to make BullMQ retry the match (with backoff) when nothing matched yet. */
-export class NoMatchYetError extends Error {
-  constructor(event: SocialEvent) {
-    super(`No listener matched ${event.type} ${event.eventId} yet`);
-    this.name = "NoMatchYetError";
-  }
-}
 
 /** The trigger's output if the event matches this listener, else null. */
 function evaluate(listener: ListenerMatch, event: SocialEvent): unknown {
@@ -50,8 +46,10 @@ function evaluate(listener: ListenerMatch, event: SocialEvent): unknown {
 
 /**
  * Matches one incoming event to listeners. Wait listeners win over entry listeners.
- * When nothing matches, throws NoMatchYetError so BullMQ retries: a reply can arrive
- * before its run has registered the wait listener.
+ * The wait side runs under the conversation lock: either a wait listener matches and the
+ * run resumes, or, if nothing matches and a wait trigger could want this event type, the
+ * event is held in automation_unmatched_events for a run that is about to wait (the reply
+ * beat the wait listener). See docs/automation.md, "Unmatched events".
  */
 export async function processEventJob(
   job: Job<AutomationEventJobData>,
@@ -59,6 +57,8 @@ export async function processEventJob(
 ): Promise<EventJobResult> {
   const event = job.data;
   const attempt = job.attemptsMade + 1;
+  // The enqueue time, i.e. when the webhook arrived, even if the queue was backed up.
+  const receivedAt = new Date(job.timestamp ?? Date.now());
   const log = {
     source: "automationEventsWorker",
     eventType: event.type,
@@ -66,14 +66,32 @@ export async function processEventJob(
   };
   logger.info({ event: "automation_event_job_started", ...log, attempt });
 
-  const listeners = await findListeners(event.type, eventKeysFor(event));
-  const matches = listeners
-    .map((listener) => ({ listener, output: evaluate(listener, event) }))
-    .filter((m) => m.output !== null);
+  const keys = eventKeysFor(event);
+  const holdable = isWaitEventType(event.type);
+  const result = await getDb().begin(async (tx) => {
+    if (holdable) await lockConversations(tx, keys);
+    const listeners = await findListeners(event.type, keys, tx);
+    const matches = listeners
+      .map((listener) => ({ listener, output: evaluate(listener, event) }))
+      .filter((m) => m.output !== null);
 
-  for (const { listener, output } of matches.filter((m) => m.listener.runId)) {
-    const resumed = await resumeRun(listener, output);
-    if (!resumed) continue; // claimed by a concurrent event; try the next one
+    for (const { listener, output } of matches.filter(
+      (m) => m.listener.runId,
+    )) {
+      // Null when a concurrent event claimed it first; try the next one.
+      const resumed = await resumeRun(tx, listener, output);
+      if (resumed) return { kind: "resumed" as const, resumed };
+    }
+    const entryMatches = matches.filter((m) => !m.listener.runId);
+    if (entryMatches.length === 0 && holdable) {
+      await holdUnmatchedEvent(tx, event, keys, receivedAt);
+      return { kind: "held" as const };
+    }
+    return { kind: "entry" as const, entryMatches };
+  });
+
+  if (result.kind === "resumed") {
+    const { resumed } = result;
     if (resumed.nextStepId)
       await deps.enqueueStep({
         runId: resumed.runId,
@@ -87,8 +105,12 @@ export async function processEventJob(
     });
     return { matched: "wait", runId: resumed.runId };
   }
+  if (result.kind === "held") {
+    logger.info({ event: "automation_event_held", ...log });
+    return { matched: "held" };
+  }
 
-  const entryMatches = matches.filter((m) => !m.listener.runId);
+  const { entryMatches } = result;
   if (entryMatches.length > 0) {
     const runIds: string[] = [];
     for (const { listener, output } of entryMatches) {
@@ -120,8 +142,7 @@ export async function processEventJob(
     return { matched: "entry", runIds };
   }
 
-  if (attempt < (job.opts.attempts ?? 1)) throw new NoMatchYetError(event);
-  logger.info({ event: "automation_event_unmatched", ...log, attempt });
+  logger.info({ event: "automation_event_unmatched", ...log });
   return { matched: "none" };
 }
 
@@ -144,9 +165,7 @@ export function startAutomationEventsWorker({
 
   worker.on("failed", (job, err) => {
     if (!job) return;
-    // NoMatchYetError is an expected retry, not a failure worth an error log.
-    const level = err instanceof NoMatchYetError ? "info" : "error";
-    logger[level]({
+    logger.error({
       event: "automation_event_job_failed",
       source: "automationEventsWorker",
       jobId: job.id,

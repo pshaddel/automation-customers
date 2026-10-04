@@ -1,8 +1,9 @@
 import { type Database, getDb } from "../db/db";
 import { NotFoundError } from "../lib/errors";
+import type { SocialEvent } from "../social-media/social-media.events";
 
 /**
- * Runs, step runs and wait listeners: the state the two workers read and write.
+ * Runs, step runs, wait listeners and unmatched events: the state the workers read and write.
  * Every state transition locks the run row (`FOR UPDATE`) so a resume, a step completion
  * and a cancellation can't interleave.
  */
@@ -219,9 +220,16 @@ export async function completeStep(params: {
   });
 }
 
+export type WaitResult =
+  | { status: "waiting"; expiresAt: Date | null }
+  | { status: "resumed"; nextStepId: string | null };
+
 /**
- * Pauses the run on a mid-flow trigger: the step run waits and a wait listener is stored,
- * expiring after `timeoutSeconds` if given. Returns the listener's expiry, if it has one.
+ * Pauses the run on a mid-flow trigger, unless an unmatched event already answers it.
+ * Under the conversation lock, it first looks for a held event that arrived after the
+ * previous step started and that `match` accepts: if there is one, the event is claimed
+ * and the run moves on at once. Otherwise the step run waits and a wait listener is
+ * stored, expiring after `timeoutSeconds` if given. Null when the run isn't running.
  */
 export async function waitOnTrigger(params: {
   runId: string;
@@ -230,12 +238,45 @@ export async function waitOnTrigger(params: {
   eventType: string;
   correlationKey: string;
   timeoutSeconds: number | undefined;
-}): Promise<Date | null> {
-  const { runId, step, sequence, eventType, correlationKey, timeoutSeconds } =
-    params;
+  match: (event: SocialEvent) => unknown;
+}): Promise<WaitResult | null> {
+  const {
+    runId,
+    step,
+    sequence,
+    eventType,
+    correlationKey,
+    timeoutSeconds,
+    match,
+  } = params;
   return getDb().begin(async (tx) => {
+    await lockConversations(tx, [correlationKey]);
     const run = await lockRun(tx, runId);
     if (run?.status !== "running") return null;
+
+    const held = await claimUnmatchedEvent(tx, {
+      runId,
+      sequence,
+      eventType,
+      correlationKey,
+      match,
+    });
+    if (held) {
+      await tx`
+        UPDATE automation_step_runs SET
+          status = 'succeeded', output = ${held.output ?? null}::jsonb, outcome = 'ok', finished_at = now()
+        WHERE run_id = ${runId} AND sequence = ${sequence}
+      `;
+      const nextStepId = await advance(
+        tx,
+        run,
+        step.key,
+        held.output,
+        step.next.ok,
+      );
+      return { status: "resumed", nextStepId };
+    }
+
     await tx`
       UPDATE automation_step_runs SET status = 'waiting'
       WHERE run_id = ${runId} AND sequence = ${sequence}
@@ -247,7 +288,10 @@ export async function waitOnTrigger(params: {
       ON CONFLICT DO NOTHING
     `;
     await tx`UPDATE automation_runs SET status = 'waiting' WHERE id = ${runId}`;
-    return waitExpiry(tx, runId, step.id);
+    return {
+      status: "waiting",
+      expiresAt: await waitExpiry(tx, runId, step.id),
+    };
   });
 }
 
@@ -397,9 +441,9 @@ export interface ListenerMatch {
 export async function findListeners(
   eventType: string,
   keys: string[],
+  db: Database = getDb(),
 ): Promise<ListenerMatch[]> {
   if (keys.length === 0) return [];
-  const db = getDb();
   const rows = await db<
     {
       id: string;
@@ -449,9 +493,11 @@ export async function findListeners(
 /**
  * Resumes a waiting run whose listener matched. The listener is claimed with
  * DELETE ... RETURNING, so of two concurrent matches only one resumes the run.
- * Returns null when someone else claimed it first.
+ * Returns null when someone else claimed it first. Runs in the caller's transaction, which
+ * holds the conversation lock (see lockConversations).
  */
 export async function resumeRun(
+  tx: Database,
   listener: ListenerMatch,
   output: unknown,
 ): Promise<{
@@ -459,29 +505,27 @@ export async function resumeRun(
   nextStepId: string | null;
   sequence: number;
 } | null> {
-  return getDb().begin(async (tx) => {
-    const [claimed] = await tx<{ run_id: string }[]>`
-      DELETE FROM automation_triggers WHERE id = ${listener.id} RETURNING run_id
-    `;
-    if (!claimed) return null;
-    const run = await lockRun(tx, claimed.run_id);
-    if (run?.status !== "waiting") return null;
-    const [stepRun] = await tx<{ sequence: number }[]>`
-      UPDATE automation_step_runs SET
-        status = 'succeeded', output = ${output ?? null}::jsonb, outcome = 'ok', finished_at = now()
-      WHERE run_id = ${run.id} AND step_id = ${listener.stepId} AND status = 'waiting'
-      RETURNING sequence
-    `;
-    if (!stepRun) return null;
-    const nextStepId = await advance(
-      tx,
-      run,
-      listener.stepKey,
-      output,
-      listener.next.ok,
-    );
-    return { runId: run.id, nextStepId, sequence: stepRun.sequence + 1 };
-  });
+  const [claimed] = await tx<{ run_id: string }[]>`
+    DELETE FROM automation_triggers WHERE id = ${listener.id} RETURNING run_id
+  `;
+  if (!claimed) return null;
+  const run = await lockRun(tx, claimed.run_id);
+  if (run?.status !== "waiting") return null;
+  const [stepRun] = await tx<{ sequence: number }[]>`
+    UPDATE automation_step_runs SET
+      status = 'succeeded', output = ${output ?? null}::jsonb, outcome = 'ok', finished_at = now()
+    WHERE run_id = ${run.id} AND step_id = ${listener.stepId} AND status = 'waiting'
+    RETURNING sequence
+  `;
+  if (!stepRun) return null;
+  const nextStepId = await advance(
+    tx,
+    run,
+    listener.stepKey,
+    output,
+    listener.next.ok,
+  );
+  return { runId: run.id, nextStepId, sequence: stepRun.sequence + 1 };
 }
 
 /**
@@ -552,6 +596,84 @@ export async function cancelActiveRuns(
   await tx`
     DELETE FROM automation_triggers WHERE automation_id = ${automationId} AND run_id IS NOT NULL
   `;
+}
+
+// ---- Unmatched events ----
+
+/** How long an unmatched event is kept. The race it covers lasts seconds. */
+export const UNMATCHED_EVENT_TTL_HOURS = 24;
+
+/**
+ * Serialises everything that touches these conversations (correlation keys) until the
+ * transaction ends: an incoming event deciding between "resume a run" and "hold", and a
+ * run deciding between "claim a held event" and "start waiting". Without it, each side
+ * could miss the other's uncommitted row. Lock order: conversation, then listener, then
+ * run row. Keys are sorted so two multi-key callers can't deadlock.
+ */
+export async function lockConversations(
+  tx: Database,
+  keys: string[],
+): Promise<void> {
+  for (const key of [...new Set(keys)].sort())
+    await tx`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
+}
+
+/** Stores an event no listener matched, once per key; a retried job inserts nothing. */
+export async function holdUnmatchedEvent(
+  tx: Database,
+  event: SocialEvent,
+  keys: string[],
+  receivedAt: Date,
+): Promise<void> {
+  for (const key of keys)
+    await tx`
+      INSERT INTO automation_unmatched_events (event_type, event_id, correlation_key, event, received_at)
+      VALUES (${event.type}, ${event.eventId}, ${key}, ${event}::jsonb, ${receivedAt})
+      ON CONFLICT DO NOTHING
+    `;
+  await tx`
+    DELETE FROM automation_unmatched_events
+    WHERE received_at < now() - ${UNMATCHED_EVENT_TTL_HOURS}::int * interval '1 hour'
+  `;
+}
+
+/**
+ * Claims the oldest held event that answers a run about to wait at `sequence`: same event
+ * type and key, received no earlier than the previous step run started (an older message
+ * can't answer a question asked after it), and accepted by `match`. Every row of that
+ * event is deleted, so it can't answer two runs.
+ */
+async function claimUnmatchedEvent(
+  tx: Database,
+  params: {
+    runId: string;
+    sequence: number;
+    eventType: string;
+    correlationKey: string;
+    match: (event: SocialEvent) => unknown;
+  },
+): Promise<{ output: unknown } | null> {
+  const { runId, sequence, eventType, correlationKey, match } = params;
+  const rows = await tx<{ event_id: string; event: SocialEvent }[]>`
+    SELECT e.event_id, e.event FROM automation_unmatched_events e
+    WHERE e.event_type = ${eventType} AND e.correlation_key = ${correlationKey}
+      AND e.received_at > now() - ${UNMATCHED_EVENT_TTL_HOURS}::int * interval '1 hour'
+      AND e.received_at >= (
+        SELECT started_at FROM automation_step_runs
+        WHERE run_id = ${runId} AND sequence = ${sequence - 1}
+      )
+    ORDER BY e.received_at, e.event_id
+  `;
+  for (const row of rows) {
+    const output = match(row.event);
+    if (output === null) continue;
+    await tx`
+      DELETE FROM automation_unmatched_events
+      WHERE event_type = ${eventType} AND event_id = ${row.event_id}
+    `;
+    return { output };
+  }
+  return null;
 }
 
 // ---- Read side for the API ----

@@ -4,7 +4,7 @@ import type {
   CommentReceivedEvent,
   MessageReceivedEvent,
 } from "../../social-media/social-media.events";
-import { NoMatchYetError, processEventJob } from "../automation-events.worker";
+import { processEventJob } from "../automation-events.worker";
 import type { StepJobData } from "../automation-steps.queue";
 import { processStepJob } from "../automation-steps.worker";
 import type { WaitTimeoutJobData } from "../automation-wait-timeouts.queue";
@@ -32,9 +32,16 @@ import {
 // Drives both processors directly (no Redis) against the dev database.
 const dbReady = await prepareDb("execution.test");
 const userIds: string[] = [];
+const accountIds: string[] = [];
 
 afterAll(async () => {
-  if (dbReady) await deleteUsers(userIds);
+  if (!dbReady) return;
+  await deleteUsers(userIds);
+  // Unmatched events aren't tied to a user, so they don't cascade.
+  for (const accountId of accountIds)
+    await getDb()`
+      DELETE FROM automation_unmatched_events WHERE event->>'accountId' = ${accountId}
+    `;
 });
 
 async function setup(
@@ -43,6 +50,7 @@ async function setup(
   const userId = await createTestUser();
   userIds.push(userId);
   const accountId = uniqueId("acc");
+  accountIds.push(accountId);
   const automation = await createAutomation(userId, "Pricing");
   for (const step of edit(pricingExampleSteps(accountId)))
     await addStep(userId, automation.id, step);
@@ -108,6 +116,8 @@ async function setup(
       SELECT sequence, status, attempt, outcome FROM automation_step_runs
       WHERE run_id = ${runId} ORDER BY sequence
     `;
+  const unmatchedEvents = (eventId: string) =>
+    getDb()`SELECT correlation_key FROM automation_unmatched_events WHERE event_id = ${eventId}`;
   const waitListeners = (runId: string) =>
     getDb()`SELECT correlation_key FROM automation_triggers WHERE run_id = ${runId}`;
   /** Moves the run's wait deadline, e.g. into the past to simulate an elapsed timeout. */
@@ -147,6 +157,7 @@ async function setup(
     runRow,
     stepRuns,
     waitListeners,
+    unmatchedEvents,
     timeouts,
     setWaitExpiry,
     runTimeout,
@@ -177,19 +188,16 @@ describe.skipIf(!dbReady)("execution (integration)", () => {
     const waitMs = (t.timeouts[0]?.expiresAt.getTime() ?? 0) - Date.now();
     expect(Math.abs(waitMs - PRICING_WAIT_SECONDS * 1000)).toBeLessThan(60_000);
 
-    // Not an email: retried while attempts remain, then unmatched; the run keeps waiting.
-    await expect(
-      processEventJob(fakeJob(t.message("hi")), t.deps),
-    ).rejects.toBeInstanceOf(NoMatchYetError);
-    expect(await processEventJob(fakeJob(t.message("hi"), 2), t.deps)).toEqual({
-      matched: "none",
+    // Not an email: held as unmatched, not retried; the run keeps waiting.
+    expect(await processEventJob(fakeJob(t.message("hi")), t.deps)).toEqual({
+      matched: "held",
     });
     expect((await t.runRow(runId))?.status).toBe("waiting");
 
     // Another contact's email doesn't resume this run.
     expect(
-      await processEventJob(fakeJob(t.message("x@y.co", "c_2"), 2), t.deps),
-    ).toEqual({ matched: "none" });
+      await processEventJob(fakeJob(t.message("x@y.co", "c_2")), t.deps),
+    ).toEqual({ matched: "held" });
 
     expect(
       await processEventJob(fakeJob(t.message("sure: me@example.com")), t.deps),
@@ -243,10 +251,13 @@ describe.skipIf(!dbReady)("execution (integration)", () => {
     `;
     expect(count?.n).toBe(1);
 
-    // Comments that don't match the keyword retry, then end unmatched.
-    expect(
-      await processEventJob(fakeJob(t.comment("c_9", "nice photo"), 2), t.deps),
-    ).toEqual({ matched: "none" });
+    // Comments that don't match the keyword end unmatched at once and aren't held:
+    // no wait trigger listens for comments.
+    const nice = t.comment("c_9", "nice photo");
+    expect(await processEventJob(fakeJob(nice), t.deps)).toEqual({
+      matched: "none",
+    });
+    expect(await t.unmatchedEvents(nice.eventId)).toEqual([]);
   });
 
   test("a retried step that already succeeded doesn't run again", async () => {
@@ -341,14 +352,12 @@ describe.skipIf(!dbReady)("execution (integration)", () => {
     expect((await t.runRow(runId))?.status).toBe("cancelled");
     expect(await t.waitListeners(runId)).toEqual([]);
     expect(
-      await processEventJob(fakeJob(t.message("me@example.com"), 2), t.deps),
-    ).toEqual({ matched: "none" });
+      await processEventJob(fakeJob(t.message("me@example.com")), t.deps),
+    ).toEqual({ matched: "held" });
     // New comments don't match an inactive automation either.
-    expect(await processEventJob(fakeJob(t.comment("c_5"), 2), t.deps)).toEqual(
-      {
-        matched: "none",
-      },
-    );
+    expect(await processEventJob(fakeJob(t.comment("c_5")), t.deps)).toEqual({
+      matched: "none",
+    });
   });
 
   test("a wait that times out follows next.timeout", async () => {
@@ -358,8 +367,8 @@ describe.skipIf(!dbReady)("execution (integration)", () => {
     await t.setWaitExpiry(runId, -1);
     // Expired: a late reply no longer matches, even before the timeout job runs.
     expect(
-      await processEventJob(fakeJob(t.message("me@example.com"), 2), t.deps),
-    ).toEqual({ matched: "none" });
+      await processEventJob(fakeJob(t.message("me@example.com")), t.deps),
+    ).toEqual({ matched: "held" });
 
     const result = await t.runTimeout();
     expect(result).toMatchObject({ status: "expired" });
@@ -458,5 +467,99 @@ describe.skipIf(!dbReady)("execution (integration)", () => {
     expect(t.timeouts).toHaveLength(2);
     expect(t.timeouts[1]).toEqual(t.timeouts[0] as (typeof t.timeouts)[0]);
     expect((await t.runRow(runId))?.status).toBe("waiting");
+  });
+
+  test("a reply that beats the wait listener is held and answers the wait", async () => {
+    const t = await setup();
+    const started = await processEventJob(fakeJob(t.comment()), t.deps);
+    const runId = started.matched === "entry" ? (started.runIds[0] ?? "") : "";
+    await t.runNextStep(); // reply
+    await t.runNextStep(); // ask: the DM is out, wait_email not registered yet
+
+    const reply = t.message("me@example.com");
+    expect(await processEventJob(fakeJob(reply), t.deps)).toEqual({
+      matched: "held",
+    });
+    expect(await t.unmatchedEvents(reply.eventId)).toHaveLength(1);
+
+    // wait_email finds the held reply and moves on without waiting.
+    const result = await t.runNextStep();
+    expect(result).toMatchObject({ status: "completed" });
+    expect(t.enqueued.at(-1)).toMatchObject({ runId, sequence: 5 });
+    expect(t.timeouts).toHaveLength(0);
+    expect(await t.waitListeners(runId)).toEqual([]);
+    expect(await t.unmatchedEvents(reply.eventId)).toEqual([]);
+    expect((await t.stepRuns(runId)).at(-1)).toMatchObject({
+      sequence: 4,
+      status: "succeeded",
+      outcome: "ok",
+    });
+
+    expect(await t.runNextStep()).toEqual({
+      status: "completed",
+      nextStepId: null,
+    }); // send_link
+    expect(JSON.stringify(t.social.sendDm.mock.calls[1]?.[0])).toContain(
+      "me@example.com",
+    );
+    expect(await t.runRow(runId)).toMatchObject({
+      status: "completed",
+      step_count: 5,
+    });
+  });
+
+  test("held events that are too old or don't match don't answer a wait", async () => {
+    const t = await setup();
+    // Sent before the question was asked: held, but too old for this run.
+    const early = t.message("old@example.com");
+    expect(await processEventJob(fakeJob(early), t.deps)).toEqual({
+      matched: "held",
+    });
+
+    const started = await processEventJob(fakeJob(t.comment()), t.deps);
+    const runId = started.matched === "entry" ? (started.runIds[0] ?? "") : "";
+    await t.runNextStep(); // reply
+    await t.runNextStep(); // ask
+    // After the question, but not an email.
+    const hi = t.message("hi");
+    expect(await processEventJob(fakeJob(hi), t.deps)).toEqual({
+      matched: "held",
+    });
+
+    expect(await t.runNextStep()).toEqual({ status: "waiting" });
+    expect((await t.runRow(runId))?.status).toBe("waiting");
+    expect(await t.unmatchedEvents(early.eventId)).toHaveLength(1);
+    expect(await t.unmatchedEvents(hi.eventId)).toHaveLength(1);
+  });
+
+  test("a reply racing the wait step always resumes the run", async () => {
+    const t = await setup();
+    for (let i = 0; i < 10; i++) {
+      const contactId = `c_race_${i}`;
+      const started = await processEventJob(
+        fakeJob(t.comment(contactId)),
+        t.deps,
+      );
+      const runId =
+        started.matched === "entry" ? (started.runIds[0] ?? "") : "";
+      await t.runNextStep(); // reply
+      await t.runNextStep(); // ask
+      const waitJob = t.enqueued.at(-1) as StepJobData;
+
+      await Promise.all([
+        processEventJob(
+          fakeJob(t.message("me@example.com", contactId)),
+          t.deps,
+        ),
+        processStepJob(fakeJob(waitJob), t.deps),
+      ]);
+      // Either the event resumed the listener or the wait claimed the held event.
+      expect(await t.runRow(runId)).toMatchObject({
+        status: "running",
+        step_count: 4,
+      });
+      expect(await t.waitListeners(runId)).toEqual([]);
+      expect(t.enqueued.at(-1)).toMatchObject({ runId, sequence: 5 });
+    }
   });
 });

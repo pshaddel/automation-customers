@@ -32,3 +32,13 @@ export function eventKeysFor(event: SocialEvent): string[] {
       for (const key of step.eventKeys(event)) keys.add(key);
   return [...keys];
 }
+
+/** Whether some mid-flow trigger listens for this event type, so an unmatched one is held. */
+export function isWaitEventType(eventType: string): boolean {
+  return listStepTypes().some(
+    (step) =>
+      step.kind === "trigger" &&
+      step.position === "wait" &&
+      step.eventType === eventType,
+  );
+}

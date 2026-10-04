@@ -49,7 +49,7 @@ src/
     automations.schema.ts       Elysia `t` request/response schemas
     automations.service.ts      automations, drafts, steps, publish, entry listeners
     validation.ts               graph validation run at publish
-    runs.service.ts             runs, step runs, wait listeners (used by the workers)
+    runs.service.ts             runs, step runs, wait listeners, unmatched events (used by the workers)
     automation-events.queue.ts  queue + enqueueEvent()
     automation-events.worker.ts matches an event to listeners (one job per event)
     automation-steps.queue.ts   queue + enqueueStep()
@@ -196,6 +196,20 @@ Constraints:
 | `outcome` | Which `next` key was followed. |
 | `error`, `started_at`, `finished_at` | |
 
+### `automation_unmatched_events`
+
+Events that matched no listener, held so a run that starts waiting just after can still claim them (see [Unmatched events](#unmatched-events)). Only event types some wait trigger listens for are stored (`isWaitEventType()` in the registry: today `message_received`), never comments. Rows are claimed with `DELETE ... RETURNING`, like listeners, so there's no `id`, status, `updated_at` or `deleted_at`.
+
+| Column | Notes |
+|---|---|
+| `event_type`, `event_id` | The platform event. |
+| `correlation_key` | One row per key from `eventKeys(event)`. Primary key `(event_type, event_id, correlation_key)`, so a retried event job inserts nothing new. |
+| `event` | jsonb, the normalized event, passed to the trigger's `match()` later. |
+| `received_at` | When the webhook arrived: the event job's enqueue time, not when the job ran. |
+| `created_at` | |
+
+Index `(event_type, correlation_key, received_at)` for the lookup, and `(received_at)` for cleanup. Migration `005_unmatched_events.sql`.
+
 ## Webhooks (simulated Instagram)
 
 Two endpoints stand in for Instagram's webhook calls, so the flow can be exercised end to end. Real Instagram sends everything to one callback URL; two routes keep the dummy simple.
@@ -227,6 +241,8 @@ Two queues, both using `DEFAULT_JOB_OPTIONS` (3 attempts, exponential backoff fr
 
 ### Event job: matching an event to listeners
 
+Steps 1, 2 and 4 run in one transaction. For an event type a wait trigger listens for, it first takes the conversation lock on each of the event's keys (see [Unmatched events](#unmatched-events)).
+
 1. Build the event's candidate keys from every trigger type for its event type (`eventKeys(event)`; a DM gives `dm:<accountId>:<contactId>`). Load the live listeners with those keys, then keep those whose trigger `match()` returns an output. An entry listener matches against its step's config, which has no templates. A wait listener matches against the input its step run resolved when the run started waiting.
 2. **Wait listeners first.** For the oldest match, in one transaction:
    - claim it with `DELETE ... WHERE id = $1 RETURNING`
@@ -234,13 +250,13 @@ Two queues, both using `DEFAULT_JOB_OPTIONS` (3 attempts, exponential backoff fr
    - mark the trigger's step run `succeeded`, with the match output
    - store that output in `context.steps[<key>]`
 
-   Then enqueue the next step. Stop here.
-3. **Otherwise, entry listeners.** For each match, create a run (`ON CONFLICT DO NOTHING` on the unique constraints), with the match output as `context.trigger` and a `succeeded` step run for the trigger at sequence 1. Then enqueue the step after the trigger.
+   After the commit, enqueue the next step. Stop here.
+3. **Otherwise, entry listeners** (after the commit). For each match, create a run (`ON CONFLICT DO NOTHING` on the unique constraints), with the match output as `context.trigger` and a `succeeded` step run for the trigger at sequence 1. Then enqueue the step after the trigger.
 4. **Nothing matched:**
-   - before the last attempt → throw a `NoMatchYetError`, and BullMQ retries in 1s, then 2s
-   - on the last attempt → complete the job and log `automation_event_unmatched`
+   - a wait trigger listens for this event type → store it in `automation_unmatched_events`, return `{ matched: "held" }` and log `automation_event_held`. A run that starts waiting later may claim it.
+   - otherwise (comments) → complete the job and log `automation_event_unmatched`
 
-   This covers a reply that arrives before its run has registered its wait listener. Since every non-matching comment is also retried twice, a later optimisation is to skip retries for event types that no mid-flow trigger uses.
+   Nothing is retried on a miss. The normal 3 attempts are only for real errors.
 
 ### Step job: the runner
 
@@ -249,13 +265,29 @@ Two queues, both using `DEFAULT_JOB_OPTIONS` (3 attempts, exponential backoff fr
 3. Look up the implementation in the registry. An unknown `step_type` raises `UnrecoverableError`.
 4. Resolve the config's templates against `run.context` and validate it with `inputSchema`. A missing template value or invalid input raises `UnrecoverableError`. Record the step run as `running`, with this attempt number and the input.
 5. Branch on the step's kind:
-   - **Trigger step (mid-flow):** in one transaction, mark the step run `waiting`, insert the wait listener with `correlationKey(input)`, and set the run to `waiting`. After the commit, if the input has `timeoutSeconds`, enqueue the delayed timeout job (see [Wait timeouts](#wait-timeouts)). Done; the event job resumes it later, or the timeout job ends the wait.
+   - **Trigger step (mid-flow):** in one transaction (`waitOnTrigger()`), take the conversation lock on `correlationKey(input)`, then lock the run.
+     - **A held event answers it** (see [Unmatched events](#unmatched-events)): claim the event, mark the step run `succeeded` with the match output and outcome `ok`, and advance the run as an action step would. After the commit, enqueue `next.ok`. No listener and no timeout job are created.
+     - **Otherwise:** mark the step run `waiting`, insert the wait listener, and set the run to `waiting`. After the commit, if the input has `timeoutSeconds`, enqueue the delayed timeout job (see [Wait timeouts](#wait-timeouts)). Done; the event job resumes it later, or the timeout job ends the wait.
    - **Action step:** call `execute(input, ctx)`. Then, in one transaction:
      - mark the step run `succeeded`, storing the output and outcome
      - store the output in `context.steps[<key>]`
      - increment `step_count`, failing the run if it goes over the cap (e.g. 50)
      - set `current_step_id = next[outcome]`, or mark the run `completed` if there's no next step
 6. After the commit, enqueue `next[outcome]` with `sequence + 1`, if there is one.
+
+### Unmatched events
+
+A run sends its question (`ask`, a `send_dm`) in one step job and registers the wait listener in the next one. A fast reply can arrive in between, and if the steps queue is backed up or the worker crashes after sending the DM, that gap can last seconds or longer. Retrying the match only covers a fixed window, so the event is stored instead and the wait looks for it.
+
+- **Held:** an event that matches no listener, of a type some wait trigger listens for, is stored in `automation_unmatched_events` with the time the webhook arrived.
+- **Claimed:** when a run reaches a mid-flow trigger, `waitOnTrigger()` looks for held events with the same event type and correlation key, oldest first, and keeps the first that:
+  - arrived no earlier than the **previous step run started** (`received_at >= started_at` of sequence − 1). A message sent before the question was asked can't answer it, e.g. an email the contact DMed on their own before commenting.
+  - passes the trigger's `match()` against the resolved input. A held "hi" doesn't answer `match: email` and stays held.
+
+  It deletes every row of that event, so one event can't answer two runs, and the run continues without waiting.
+- **The conversation lock:** both transactions (the event job's match-or-hold and `waitOnTrigger()`'s claim-or-wait) first take `pg_advisory_xact_lock(hashtext(correlation_key))`. Without it, each could miss the other's uncommitted row (the event sees no listener, the wait sees no held event) and the reply would be lost. With it, one commits first and the other sees its row. Lock order everywhere: **conversation, then listener, then run row**. Keys are sorted when an event has several. A hash collision only serialises two unrelated conversations.
+- **Cleanup:** the lookup ignores rows older than 24h (`UNMATCHED_EVENT_TTL_HOURS`), and each insert deletes them. The race only needs seconds, so no separate job.
+- **Clocks:** `received_at` comes from the app (BullMQ's enqueue time) and `started_at` from Postgres. They only need to agree to well under the time it takes to send a DM and get a reply.
 
 ### Wait timeouts
 
@@ -317,7 +349,7 @@ Walkthrough:
 1. `POST .../webhooks/comments` with "pricing" → event job matches the entry listener `account:acc_1` → a run is created and `reply` is enqueued.
 2. Step jobs run `reply` (`commentOnPost`), then `ask` (`sendDm`).
 3. `wait_email` registers a wait listener on `dm:acc_1:<contactId>`, and the run goes to `waiting`.
-4. `POST .../webhooks/messages` with "hi" → `match: email` rejects it → no match → retried twice → unmatched. The run keeps waiting.
+4. `POST .../webhooks/messages` with "hi" → `match: email` rejects it → no match → held as unmatched. The run keeps waiting.
 5. `POST .../webhooks/messages` with "me@x.com" → the wait listener matches → the run resumes → `send_link` runs → the run is `completed`.
 6. No email within 23h instead: the delayed timeout job ends the wait with outcome `timeout` → `remind` runs → the run is `completed`.
 
@@ -336,7 +368,7 @@ A version that wants to answer "that doesn't look like an email" can use `match:
 | Step names | Permanent `step_type` strings = folder names, mapped in one registry | Class names or file paths as ids: renaming code would break stored automations. |
 | Step settings | `config` jsonb + zod `inputSchema` per step type in code | `input_structure`/`output_structure` per row: the schema is the same for every step of a type, so it belongs in code. |
 | Unit of work | One BullMQ job per event and one per step | One job per run: a wait would hold a worker, and one failing step would retry the whole run, including messages already sent. Matching inside the webhook request: slow, and impossible to retry. |
-| Reply-before-wait race | The event job retries the match 3 times with exponential backoff | Matching once: a fast reply is lost. A separate inbox table scanned when a wait registers: more moving parts. |
+| Reply-before-wait race | Unmatched events are held in a table; a run that starts waiting claims a matching one, both sides under a per-conversation advisory lock | Retrying the match with backoff (v1: 3 attempts, about 3s): any fixed window loses the reply when the steps queue is backed up or a worker crashes after sending the DM, and a longer window retries every non-matching comment too. Registering the listener in the same transaction as the previous step: shrinks the gap, but the DM still goes out before that commit. |
 | Failure writes | A shared runner writes step-run and run status; the failure handler runs inside the processor | Each implementation writing its own DB status: duplicated and easy to get wrong. `worker.on("failed")` as the handler: in memory only, lost if the process dies, and fires on every attempt. |
 
 ## Edge cases
@@ -347,11 +379,11 @@ A version that wants to answer "that doesn't look like an email" can use `match:
 | 2 | Two replies at once for one waiting run | Listener claimed with `DELETE ... RETURNING`; whoever gets no row does nothing | Handled |
 | 3 | Worker retries after the step's side effect succeeded | A succeeded step run for `(run_id, sequence)` is never re-executed; the retry only advances the run | Handled (a crash between the platform call and the DB write can still double-send; `idempotencyKey` is passed so a real client can dedupe) |
 | 4 | Crash after commit, before the next step is enqueued | Step job: BullMQ retries it, and the runner sees the succeeded step run and re-enqueues the run's current step (next sequence = `step_count + 1`). Event job that started a run: the retry hits the duplicate-event constraint and re-enqueues that run's current step | Handled |
-| 5 | Reply arrives before the wait listener exists | The event job retries the match up to 3 times (backoff 1s, 2s), a window of about 3s | Handled |
+| 5 | Reply arrives before the wait listener exists | Held in `automation_unmatched_events`; the wait claims it and the run continues at once. The conversation lock means the two can't miss each other however long the gap ([Unmatched events](#unmatched-events)) | Handled |
 | 6 | Message fits both a wait listener and an entry listener (user DMs "pricing" while we wait for their email) | Wait listeners win; no new run starts | Handled |
 | 7 | Several runs waiting on the same contact | The oldest listener wins | Handled |
 | 8 | Same person triggers the automation again while a run is active | Ignored, by `UNIQUE (automation_id, subject_key)` on active runs | Handled |
-| 9 | Reply doesn't match (not an email) | `match()` returns null; after its retries the event is unmatched and the run keeps waiting | Handled |
+| 9 | Reply doesn't match (not an email) | `match()` returns null; the event is held (and later dropped) and the run keeps waiting | Handled |
 | 10 | Our own comment replies and DM echoes come back as webhooks | Dropped in `webhooks.service.ts` before enqueueing | Handled |
 | 11 | Infinite loop in the graph | `step_count` cap fails the run | Handled |
 | 12 | Graph errors (missing entry trigger, unknown `step_type`, dangling `next` ids, unreachable steps, invalid config, a trigger in a position it doesn't support) | Validated when a version is published; drafts can be invalid | Handled |
@@ -363,6 +395,7 @@ A version that wants to answer "that doesn't look like an email" can use `match:
 | 18 | Contact never replies | Without `timeoutSeconds` the run waits indefinitely. With it, the listener gets `expires_at`, and a delayed job claims it and follows `next.timeout`, or completes the run ([Wait timeouts](#wait-timeouts)) | Handled when `timeoutSeconds` is set; a lost delayed job needs the sweep from #17 |
 | 23 | Reply arrives after the deadline but before the timeout job runs | `findListeners` ignores expired listeners, so the reply doesn't match | Handled |
 | 24 | Reply and timeout at the same moment | Both claim the listener with `DELETE ... RETURNING` first; only one gets the row | Handled |
+| 25 | The contact DMs something before the question is asked (e.g. their email, unprompted) | Held, but a wait only claims events received after its previous step started | Handled |
 | 19 | Platform messaging rules (e.g. Instagram allows one private reply to a comment and a limited window after the contact's last message) | Not enforced. `timeoutSeconds` is capped at 24h so a wait can't outlive Instagram's messaging window, but nothing forces an author to set it | Partly handled; verify against platform docs |
 | 20 | Unsigned webhook requests | The dummy endpoints accept any caller | Limitation; real endpoints verify `X-Hub-Signature-256` |
 | 21 | The commenter's `from.id` (comment webhook) differs from the DM `sender.id` for the same person | The wait listener would never match | Verify against platform docs; if they differ, map both ids to one contact |
@@ -458,6 +491,7 @@ Test conventions follow the existing suites: integration tests hit the docker Po
 - **Shared helpers:** `isUniqueViolation` moved to `src/db/db.ts` for reuse. `ValidationError` (`400`, with `details`) was added to `src/lib/errors.ts`.
 - **Dashboard example:** the dashboard carries its own copy of the "pricing" example (`load the brief's example`), because the static UI has no build step to import `pricing-example.ts`.
 - **Wait timeouts** (added after v1): `timeoutSeconds` on `message_received`, `automation_triggers.expires_at` (migration `004`), the `automation-wait-timeouts` queue and worker. The "pricing" example now waits 23h and then sends one reminder (`remind`). See [Wait timeouts](#wait-timeouts).
+- **Unmatched events** (added after wait timeouts): the event job no longer retries a miss (`NoMatchYetError` is gone). It holds the event in `automation_unmatched_events` (migration `005`), and `waitOnTrigger()` claims it, both under a per-conversation advisory lock. See [Unmatched events](#unmatched-events).
 - **Tests:** unit tests per step type, templates, validation and webhook normalization. Integration tests for the API (`automations.route.test.ts`), both processors driven with fake jobs (`execution.test.ts`), and the full HTTP → BullMQ → workers flow on isolated queues (`e2e.test.ts`).
 
 ### Open questions

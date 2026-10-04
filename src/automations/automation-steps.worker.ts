@@ -109,17 +109,42 @@ export async function processStepJob(
     await startStepRun({ runId, stepId, sequence, attempt, input });
 
     if (type.kind === "trigger") {
-      const expiresAt = await waitOnTrigger({
+      const wait = await waitOnTrigger({
         runId,
         step,
         sequence,
         eventType: type.eventType,
         correlationKey: type.correlationKey(input),
         timeoutSeconds: type.timeoutSeconds?.(input),
+        match: (event) =>
+          event.type === type.eventType ? type.match(event, input) : null,
       });
-      if (expiresAt)
-        await deps.enqueueWaitTimeout({ runId, stepId, sequence }, expiresAt);
-      logger.info({ event: "automation_run_waiting", ...log, expiresAt });
+      if (!wait) return skip("run is no longer running");
+      // An unmatched event already answered the wait (the reply beat the listener).
+      if (wait.status === "resumed") {
+        if (wait.nextStepId)
+          await deps.enqueueStep({
+            runId,
+            stepId: wait.nextStepId,
+            sequence: sequence + 1,
+          });
+        logger.info({
+          event: "automation_run_resumed_from_unmatched_event",
+          ...log,
+          nextStepId: wait.nextStepId,
+        });
+        return { status: "completed", nextStepId: wait.nextStepId };
+      }
+      if (wait.expiresAt)
+        await deps.enqueueWaitTimeout(
+          { runId, stepId, sequence },
+          wait.expiresAt,
+        );
+      logger.info({
+        event: "automation_run_waiting",
+        ...log,
+        expiresAt: wait.expiresAt,
+      });
       return { status: "waiting" };
     }
 
