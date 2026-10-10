@@ -2,6 +2,8 @@
 
 How to run, try and call the automation backend. The design (architecture, data model, execution model) is in the [README](../README.md); every edge case and design decision is in [automation.md](automation.md).
 
+New to the code? The [Automation Engine Field Guide](https://claude.ai/artifact/1xNMEhi1hTDYj2wpHi6uUM) walks through the architecture, every table and how they relate, and a run stage by stage, then ends with a quiz on the source code.
+
 ## Quick Start
 
 Requirements: [Bun](https://bun.sh) ≥ 1.3, Docker with Compose.
